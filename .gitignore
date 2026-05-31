@@ -1,0 +1,21 @@
+# Runtime / machine-specific (kept local, not published)
+# your live config — copy from config.example.yaml
+config.yaml
+logs/
+state.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Internal build/research scripts (dev artifacts)
+.build-workflow.js
+.research-workflow.js
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
