@@ -1,0 +1,71 @@
+# local-engine-router — example configuration
+# ---------------------------------------------------------------------------
+# Copy this to config.yaml and edit for your machine:
+#     cp config.example.yaml config.yaml
+# Routing is by the request's `model` field; only one heavy engine holds the
+# GPU at a time, so the router swaps engines on demand.
+
+# --- Bind address ----------------------------------------------------------
+# Default is localhost-only (safe). Set to 0.0.0.0 ONLY if you must reach the
+# router off-localhost (e.g. from a Docker container via the bridge gateway).
+# If you do, set `api_keys` below or ensure a host firewall restricts access.
+host: 127.0.0.1
+port: 8077
+
+# --- Authentication --------------------------------------------------------
+# If non-empty, every request except GET /health must present a key via
+#   Authorization: Bearer <key>     or     X-API-Key: <key>
+# Leave empty for no auth (only safe on a localhost bind).
+api_keys: []
+# api_keys:
+#   - "change-me-to-a-long-random-string"
+
+log_level: INFO
+log_file: ./logs/router.log
+state_file: ./state.json
+
+# SSE keep-alive comments keep streaming clients alive during a (possibly slow)
+# engine swap so they don't hit an idle/first-token timeout.
+swap_keepalive_enabled: true
+swap_keepalive_interval_s: 5.0
+
+# Wait this long for in-flight requests to finish before stopping an engine.
+drain_timeout_s: 30.0
+upstream_connect_timeout_s: 15.0
+# After freeing one engine, wait for the kernel to reclaim its (unified) memory
+# before starting the next — ends as soon as free memory plateaus, capped here.
+swap_memory_settle_timeout_s: 25.0
+
+# --- Engines ---------------------------------------------------------------
+# `ds4` here is an example of a bespoke server managed by a systemctl --user
+# unit. `ollama` is managed by unloading its models (keep_alive:0).
+ds4:
+  enabled: true
+  base_url: http://127.0.0.1:8099
+  control: systemd-user          # or "process" (launch serve_script + SIGTERM)
+  systemd_user_unit: ds4.service
+  process_pattern: ds4/ds4-server
+  health_path: /v1/models
+  start_timeout_s: 240.0
+  stop_timeout_s: 45.0
+  serve_script: /path/to/ds4/serve.sh   # used only when control: process
+
+ollama:
+  enabled: true
+  base_url: http://127.0.0.1:11434
+  health_path: /api/tags
+  unload_timeout_s: 60.0
+  systemd_unit: ollama.service
+  tags_cache_ttl_s: 30.0
+
+# Static model->engine registry. The `id` must match what clients send.
+# Unknown ids fall back to a live Ollama tag lookup at request time.
+models:
+  - id: deepseek-v4-flash
+    engine: ds4
+    display_name: DeepSeek V4 Flash
+    context_length: 131072
+  - id: qwen3.6-uncensored:27b
+    engine: ollama
+    display_name: Qwen3.6 Uncensored 27B
+    context_length: 262144
