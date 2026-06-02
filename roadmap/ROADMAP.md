@@ -39,66 +39,42 @@ GB10). Four things no maintained tool does today:
 
 ## Done
 
+> Big rocks 1–7 below were delivered across two build-out waves and are shipped
+> as of **v0.2.0** on the `roadmap-buildout` branch.
+
 - [x] Core swap state machine (asyncio lock + in-flight drain), mutual exclusion
 - [x] Explicit `/proc/meminfo` memory-settle wait before starting the next engine
 - [x] Dual API surface: OpenAI `/v1/*` + Ollama-native `/api/*`
-- [x] SSE keep-alive heartbeats during swap (⚠️ currently `/v1/*` streaming only)
 - [x] `ds4` (systemctl --user) + Ollama (keep_alive:0) engine backends
 - [x] `/status`, `/admin/swap`, `routerctl` CLI, systemd user service, persisted state
 - [x] **LICENSE** — MIT (attribution to `rxxusp`). *[blocker — done]*
 - [x] **API-key auth + safe default bind** — `Authorization: Bearer` / `X-API-Key`,
       constant-time check, `/health` exempt; default bind `127.0.0.1`; startup
       warning when exposed without keys. *[blocker — done]*
-
----
-
-## Big rocks (provisional, ~1–3 weeks total)
-
-### 1. Generalize the engine layer — **[L]**  *(gates the "engine-agnostic" claim)*
-Replace the hardcoded `ds4`/`ollama` typed classes with reusable abstractions so
-new engines need **config only, no Python**:
-- `GenericProcessEngine` — `{ start_cmd, env, ready_url, ready_timeout_s, stop_signal }`.
-  Covers **llama.cpp/llama-server, llamafile, vLLM, SGLang, Aphrodite**.
-- `APISwapEngine` — load/unload by HTTP. Generalizes the current `OllamaEngine`
-  and also covers **TabbyAPI**.
-- Keep `Ds4Engine` as the bespoke escape hatch (systemd / odd lifecycle).
-- Carry over the two things that already make us robust: per-engine cold-start
-  timeouts (vLLM/SGLang take minutes) and SIGTERM→SIGKILL + port-close
-  verification (llama.cpp has a confirmed SIGTERM-freeze bug).
-- Do **not** target TGI (HuggingFace archived it, March 2026).
-
-### 2. Extend SSE keep-alive to non-stream + Ollama NDJSON — **[M]**  *(headline-feature integrity)*
-⚠️ Load-bearing caveat: today the keep-alive heartbeat fires **only on `/v1/*`
-streaming**. Non-streaming calls and `/api/*` NDJSON streams still **block for
-the entire swap** (up to 240 s for ds4) and will time clients out. Either emit
-periodic holding frames on those paths too, or clearly document that non-stream
-callers must raise their client timeout. Can't headline keep-alive until this is
-fixed or scoped.
-
-### 3. Packaging — **[M]**
-`pyproject.toml` (pipx install of `routerctl` + the service) and a pinned-CUDA
-Docker image published to `ghcr.io`. Discovery dead-ends at `git clone` without it.
-
-### 4. Tests + CI — **[M]**
-`pytest` + an async httpx client + a mock backend HTTP server can exercise
-acquire/release/drain/swap **without a GPU**. Add a GitHub Actions workflow +
-badge. (llama-swap has no visible test suite — a differentiator.)
-
-### 5. Config validation + JSON Schema — **[M]**
-Config loading is dataclass-based and silently ignores unknown keys. Add
-startup validation with human-readable errors (e.g. "unit ds4.service not
-found") and export a JSON Schema for editor autocomplete. (Note: README implied
-pydantic but config is plain dataclasses — this is real work, not a one-liner.)
-
-### 6. Prometheus `/metrics` — **[S, ~20 lines]**
-Expose metrics no other proxy can: `swap_duration_seconds` (histogram),
-`memory_settle_seconds`, `in_flight_at_swap_start`, `engine_uptime_seconds`.
-They quantify the cost of GPU time-sharing.
-
-### 7. README hero + semver/CHANGELOG — **[S–M]**
-Tight problem statement + install + minimal config, leading with the
-memory-settle + keep-alive differentiators. Adopt semver with a `v0.x` channel
-and keep `CHANGELOG.md` current.
+- [x] **1. Generalized engine layer** *(v0.2.0)* — optional top-level `engines:`
+      table; `GenericProcessEngine` (llama.cpp/llamafile/vLLM/SGLang/Aphrodite,
+      with per-engine cold-start timeouts + SIGTERM→SIGKILL + port-close
+      verification), `APISwapEngine` (HTTP load/unload, covers TabbyAPI),
+      `OllamaEngine` as an `APISwapEngine` preset, `Ds4Engine` as the bespoke
+      escape hatch. Engines now need **config only, no Python**; legacy
+      `ds4:`/`ollama:` mode is unchanged when `engines:` is absent.
+- [x] **2. Keep-alive on all streaming paths** *(v0.2.0)* — SSE comments on
+      `/v1/*` AND bare-newline holding frames on `/api/*` NDJSON. Remaining
+      caveat (documented): non-stream callers must raise their read-timeout.
+- [x] **3. Packaging** *(v0.2.0)* — `pyproject.toml` (console scripts
+      `llm-router` + `routerctl`), a pure-Python `Dockerfile` (`python:3.12-slim`,
+      no CUDA — a pinned-CUDA base was rejected as needless bloat), and a
+      `docker-publish` workflow pushing to `ghcr.io`.
+- [x] **4. Tests + CI** *(v0.2.0)* — 69 hermetic pytest tests (no GPU/network,
+      mock backend) + a `ci.yml` GitHub Actions workflow + badge.
+- [x] **5. Config validation + JSON Schema** *(v0.2.0)* — `ConfigError` with
+      actionable messages, `config_json_schema()` / `config.schema.json`, and
+      `--print-schema` / `--check-config` CLI modes.
+- [x] **6. Prometheus `/metrics`** *(v0.2.0)* — `swap_duration_seconds`,
+      `memory_settle_seconds`, `in_flight_at_swap_start` (histograms),
+      `swap_total` (counter), `engine_uptime_seconds` (gauge); zero new deps.
+- [x] **7. README hero + semver/CHANGELOG** *(v0.2.0)* — problem-led README with
+      the four differentiators, `0.x` semver channel, `CHANGELOG.md` kept current.
 
 ---
 
