@@ -1,0 +1,40 @@
+# Keep the build context small and free of host-specific / secret files.
+# NOTE: README.md and LICENSE are COPY'd by the Dockerfile, so they are NOT
+# excluded here even though *.md drafts/docs are.
+
+# VCS / CI
+.git
+.gitignore
+.github
+
+# Runtime / machine-specific (never bake into the image)
+config.yaml
+logs/
+state.json
+
+# Python build/cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Tests (sibling-owned) — not needed in the runtime image
+tests/
+.pytest_cache/
+
+# Docs & drafts (README.md/LICENSE are re-included by the Dockerfile COPY)
+CHANGELOG.md
+roadmap/
+deploy/
+
+# Internal dev/build scripts
+.build-workflow.js
+.research-workflow.js
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
