@@ -76,6 +76,96 @@ def _resolve_signal(name: str | int) -> int:
     return int(sig)
 
 
+def _iter_objects(data: Any):
+    """Yield every dict found at the top level of *data* (object, or list)."""
+    if isinstance(data, dict):
+        yield data
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                yield item
+
+
+def _collect_string_values(data: Any) -> set[str]:
+    """Collect candidate model-id strings from a readiness/list response.
+
+    Handles the common shapes: a bare list of strings, a list of objects with
+    an id/model/name field, or an object with a ``data``/``models`` list of
+    either. Best-effort — used only to assert a model id is present."""
+    found: set[str] = set()
+
+    def _from_entry(entry: Any) -> None:
+        if isinstance(entry, str):
+            found.add(entry)
+        elif isinstance(entry, dict):
+            for k in ("id", "model", "name"):
+                v = entry.get(k)
+                if isinstance(v, str):
+                    found.add(v)
+
+    if isinstance(data, list):
+        for entry in data:
+            _from_entry(entry)
+    elif isinstance(data, dict):
+        _from_entry(data)
+        for k in ("data", "models"):
+            seq = data.get(k)
+            if isinstance(seq, list):
+                for entry in seq:
+                    _from_entry(entry)
+    return found
+
+
+def _ready_check_passes(ready_check: str, response) -> bool:
+    """Evaluate an optional richer readiness assertion against *response*.
+
+    Two forms (see config.GenericProcessConfig.ready_check):
+      * ``"model:<id>"`` — <id> must appear in the response's model list.
+      * ``"key==value"`` — some object in the JSON body must have key == value.
+    Empty/None ``ready_check`` always passes (HTTP 200 already verified)."""
+    spec = (ready_check or "").strip()
+    if not spec:
+        return True
+    try:
+        data = response.json()
+    except (ValueError, TypeError):
+        # Body isn't JSON but a body assertion was requested -> not ready.
+        return False
+
+    if spec.startswith("model:"):
+        wanted = spec[len("model:"):].strip()
+        return bool(wanted) and wanted in _collect_string_values(data)
+
+    if "==" in spec:
+        key, _, value = spec.partition("==")
+        key = key.strip()
+        value = value.strip()
+        for obj in _iter_objects(data):
+            if key in obj and str(obj[key]) == value:
+                return True
+        return False
+
+    log.warning("unrecognised ready_check %r; treating server 200 as ready", spec)
+    return True
+
+
+def _render_body(tmpl: dict[str, Any] | None, name: str | None) -> dict[str, Any]:
+    """Substitute ``{model}`` in every string value of *tmpl* with *name*.
+
+    Shared by the load and unload request builders. With no *name* the template
+    is returned unchanged (a copy)."""
+    tmpl = tmpl or {}
+    if not name:
+        return dict(tmpl)
+    out: dict[str, Any] = {}
+    for k, v in tmpl.items():
+        if isinstance(v, str):
+            out[k] = v.replace("{model}", name)
+        else:
+            out[k] = v
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Engine implementations
 # --------------------------------------------------------------------------- #
@@ -85,9 +175,17 @@ class Engine:
     key: str
     base_url: str
 
-    def __init__(self) -> None:
+    def __init__(self, control_headers: dict[str, str] | None = None) -> None:
         # Short-timeout client for control/health calls (never user traffic).
-        self._ctl = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
+        # control_headers (optional) are sent on every such call by default —
+        # e.g. an x-admin-key for a secured TabbyAPI or an Authorization bearer
+        # for LM Studio/LocalAI. They are NOT added to the user-traffic proxy
+        # client (see proxy.make_client); only this control client carries them.
+        headers = {str(k): str(v) for k, v in (control_headers or {}).items()}
+        self._ctl = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            headers=headers or None,
+        )
 
     async def aclose(self) -> None:
         await self._ctl.aclose()
@@ -127,7 +225,7 @@ class Ds4Engine(Engine):
     key = "ds4"
 
     def __init__(self, cfg, *, key: str = "ds4") -> None:
-        super().__init__()
+        super().__init__(getattr(cfg, "control_headers", None))
         self.key = key
         self.cfg = cfg
         self.base_url = cfg.base_url.rstrip("/")
@@ -329,7 +427,7 @@ class GenericProcessEngine(Engine):
     """
 
     def __init__(self, cfg, *, key: str) -> None:
-        super().__init__()
+        super().__init__(getattr(cfg, "control_headers", None))
         self.key = key
         self.cfg = cfg
         self.base_url = (cfg.base_url or "").rstrip("/")
@@ -339,7 +437,9 @@ class GenericProcessEngine(Engine):
     async def is_ready(self) -> bool:
         try:
             r = await self._ctl.get(self.base_url + self.cfg.ready_path)
-            return r.status_code == 200
+            if r.status_code != 200:
+                return False
+            return _ready_check_passes(getattr(self.cfg, "ready_check", ""), r)
         except (httpx.HTTPError, OSError):
             return False
 
@@ -460,14 +560,31 @@ class GenericProcessEngine(Engine):
         log.info("%s: stopped, VRAM released", self.key)
 
     def _signal_pids(self, pids: list[int], sig: int) -> None:
+        """Signal every PID's whole PROCESS GROUP, then any PID directly.
+
+        We launch with start_new_session=True so the launcher leads its own
+        session/group; signalling the GROUP (os.killpg) reaps forked workers
+        (vLLM/SGLang/Aphrodite/MAX spawn child processes) — not just the
+        launcher. Process groups are de-duplicated so a shared group is signalled
+        once. PIDs whose group can't be resolved (e.g. strays found via
+        process_pattern that aren't in our session) are signalled directly as a
+        fallback so the group signal never silently misses them."""
+        signalled_pgids: set[int] = set()
         for pid in pids:
-            # Signal the whole process group (we launched with
-            # start_new_session=True, so the leader's pgid == its pid).
             try:
-                os.killpg(os.getpgid(pid), sig)
-                continue
+                pgid = os.getpgid(pid)
             except (ProcessLookupError, PermissionError, OSError):
-                pass
+                pgid = None
+            if pgid is not None:
+                if pgid in signalled_pgids:
+                    continue
+                try:
+                    os.killpg(pgid, sig)
+                    signalled_pgids.add(pgid)
+                    continue
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            # Fallback: signal the PID directly (reaps strays the group missed).
             try:
                 os.kill(pid, sig)
             except ProcessLookupError:
@@ -515,7 +632,7 @@ class APISwapEngine(Engine):
     """
 
     def __init__(self, cfg, *, key: str) -> None:
-        super().__init__()
+        super().__init__(getattr(cfg, "control_headers", None))
         self.key = key
         self.cfg = cfg
         self.base_url = (cfg.base_url or "").rstrip("/")
@@ -525,7 +642,9 @@ class APISwapEngine(Engine):
     async def is_ready(self) -> bool:
         try:
             r = await self._ctl.get(self.base_url + self.cfg.health_path)
-            return r.status_code == 200
+            if r.status_code != 200:
+                return False
+            return _ready_check_passes(getattr(self.cfg, "ready_check", ""), r)
         except (httpx.HTTPError, OSError):
             return False
 
@@ -546,29 +665,75 @@ class APISwapEngine(Engine):
 
     # -- loaded models / unload ----------------------------------------- #
     async def loaded_models(self) -> list[str]:
-        """List currently-loaded models via the configured loaded_path probe."""
+        """List currently-loaded models via the configured loaded_path probe.
+
+        Returns the UNLOAD identifiers: keyed by ``loaded_id_key`` when set
+        (e.g. LM Studio's per-instance id), else by ``loaded_name_key`` (the
+        display name). Entries are filtered by ``loaded_filter`` so only models
+        that are ACTUALLY loaded are returned. These ids feed free_vram()'s
+        {model} unload substitution."""
+        data = await self._fetch_loaded()
+        if data is None:
+            return []
+        return self._extract_loaded_names(data, by_id=True)
+
+    async def loaded_model_names(self) -> list[str]:
+        """Like loaded_models() but always keyed by the display name.
+
+        Used to decide whether a requested model id is already loaded (the
+        load_path skip check), independent of any distinct unload id."""
+        data = await self._fetch_loaded()
+        if data is None:
+            return []
+        return self._extract_loaded_names(data, by_id=False)
+
+    async def _fetch_loaded(self) -> Any | None:
+        """GET loaded_path and return parsed JSON, or None if unconfigured/down."""
         path = getattr(self.cfg, "loaded_path", None)
         if not path:
-            return []
+            return None
         try:
             r = await self._ctl.get(self.base_url + path)
-            data = r.json()
+            return r.json()
         except (httpx.HTTPError, OSError, ValueError):
-            return []
-        return self._extract_loaded_names(data)
+            return None
 
-    def _extract_loaded_names(self, data: Any) -> list[str]:
-        names: list[str] = []
+    def _extract_loaded_names(self, data: Any, *, by_id: bool = True) -> list[str]:
         key = getattr(self.cfg, "loaded_models_key", "models")
         name_key = getattr(self.cfg, "loaded_name_key", "name")
-        entries = data.get(key, []) if isinstance(data, dict) else data
+        id_key = (getattr(self.cfg, "loaded_id_key", "") or "") if by_id else ""
+        filter_spec = getattr(self.cfg, "loaded_filter", "") or ""
+        fkey, fval = "", ""
+        if "==" in filter_spec:
+            fkey, _, fval = filter_spec.partition("==")
+            fkey, fval = fkey.strip(), fval.strip()
+
+        # Resolve the list of entries. A loaded_path may return a list, a
+        # wrapper object with the list under loaded_models_key (Ollama /api/ps),
+        # or a SINGLE loaded-model object (TabbyAPI /v1/model returns one object,
+        # not a list) — treat that lone object as a one-element list.
+        if isinstance(data, dict):
+            if key in data and isinstance(data[key], list):
+                entries: Any = data[key]
+            else:
+                entries = [data]
+        else:
+            entries = data
+
+        names: list[str] = []
         for m in entries or []:
             if isinstance(m, str):
+                # A bare string entry can't be filtered or id-keyed.
                 names.append(m)
             elif isinstance(m, dict):
-                name = m.get(name_key) or m.get("model") or m.get("id")
-                if name:
-                    names.append(name)
+                if fkey and str(m.get(fkey)) != fval:
+                    continue  # not actually loaded per loaded_filter
+                if id_key:
+                    val = m.get(id_key)
+                else:
+                    val = m.get(name_key) or m.get("model") or m.get("id")
+                if val:
+                    names.append(val)
         return names
 
     async def free_vram(self) -> None:
@@ -618,16 +783,40 @@ class APISwapEngine(Engine):
 
     def _render_unload_body(self, name: str | None) -> dict[str, Any]:
         """Substitute {model} in the configured unload_body with *name*."""
-        tmpl = getattr(self.cfg, "unload_body", None) or {}
-        if not name:
-            return dict(tmpl)
-        out: dict[str, Any] = {}
-        for k, v in tmpl.items():
-            if isinstance(v, str):
-                out[k] = v.replace("{model}", name)
-            else:
-                out[k] = v
-        return out
+        return _render_body(getattr(self.cfg, "unload_body", None), name)
+
+    # -- explicit per-model load (load_path engines: TabbyAPI, TGW) ------- #
+    async def load_model(self, model_id: str) -> None:
+        """Load *model_id* via the configured load_path (no-op if unset).
+
+        For engines that require an explicit load before they can serve a model
+        (TabbyAPI, text-generation-webui). JIT engines (Ollama) leave load_path
+        empty and load on first request, so this is a no-op for them."""
+        url_path = getattr(self.cfg, "load_path", "") or ""
+        if not url_path:
+            return
+        method = (getattr(self.cfg, "load_method", "POST") or "POST").upper()
+        body = _render_body(getattr(self.cfg, "load_body", None), model_id)
+        timeout_s = float(getattr(self.cfg, "load_timeout_s", 120.0) or 120.0)
+        log.info("%s: loading model %s via %s", self.key, model_id, url_path)
+        try:
+            r = await self._ctl.request(
+                method,
+                self.base_url + url_path,
+                json=body if body else None,
+                timeout=httpx.Timeout(timeout_s, connect=5.0),
+            )
+        except (httpx.HTTPError, OSError) as exc:
+            raise EngineError(
+                f"{self.key}: failed to load model {model_id!r}: {exc}"
+            ) from exc
+        if r.status_code >= 400:
+            raise EngineError(
+                f"{self.key}: load of model {model_id!r} returned "
+                f"HTTP {r.status_code}"
+            )
+        # Loading another model frees VRAM/changes loaded set; drop tag cache.
+        self._tags_cache = None
 
     # -- available tags (for routing fallback + /v1/models) -------------- #
     async def available_tags(self) -> set[str]:
@@ -640,7 +829,10 @@ class APISwapEngine(Engine):
         ttl = getattr(self.cfg, "tags_cache_ttl_s", 30.0)
         if self._tags_cache and now - self._tags_cache[0] < ttl:
             return self._tags_cache[1]
-        tags = set(await self.loaded_models())
+        # Routing matches on the model id clients send, so tags must be the
+        # display names, NOT the unload identifiers (loaded_id_key, e.g. an LM
+        # Studio instance_id) that loaded_models() returns.
+        tags = set(await self.loaded_model_names())
         self._tags_cache = (now, tags)
         return tags
 
@@ -818,15 +1010,27 @@ class EngineManager:
             await e.aclose()
 
     # -- routing --------------------------------------------------------- #
+    def resolve_model_id(self, model_id: str | None) -> str | None:
+        """Resolve a request alias to its real model id (single hop, no chains).
+
+        Returns *model_id* unchanged if it is not a configured alias. Used by
+        engine_for() and by the HTTP layer to rewrite the outgoing body so the
+        upstream sees the REAL model id, never the alias."""
+        if not model_id:
+            return model_id
+        return self.cfg.aliases.get(model_id, model_id)
+
     async def engine_for(self, model_id: str | None) -> Engine:
         """Resolve which engine owns *model_id*.
 
-        Static registry first, then a live API-swap tag lookup (so models
-        pulled after the router started still route correctly), then a
-        best-effort guess (a process engine's fixed ids; otherwise an
-        API-swap engine that can serve arbitrary tags)."""
+        Aliases are resolved first, then the static registry, then a live
+        API-swap tag lookup (so models pulled after the router started still
+        route correctly), then a best-effort guess (a process engine's fixed
+        ids; otherwise an API-swap engine that can serve arbitrary tags)."""
         if not model_id:
             raise EngineError("request is missing a 'model' field")
+
+        model_id = self.resolve_model_id(model_id)
 
         spec = self.index.get(model_id)
         if spec:
@@ -864,13 +1068,38 @@ class EngineManager:
     async def acquire(self, model_id: str | None) -> Engine:
         """Ensure the engine owning *model_id* is active, count one in-flight
         request against it, and return it. Pair with release()."""
-        target = await self.engine_for(model_id)
+        real_id = self.resolve_model_id(model_id)
+        target = await self.engine_for(real_id)
         async with self._swap_lock:
             if self.active_engine != target.key:
                 await self._swap_to(target)
+            # Explicit-load engines (api_swap with a load_path) need the
+            # requested model loaded into the now-active engine before we serve.
+            # Done under _swap_lock (so it can't race a swap) and BEFORE the
+            # in-flight increment (so a load failure leaks no in-flight count).
+            await self._ensure_model_loaded(target, real_id)
             async with self._inflight_cond:
                 self._inflight[target.key] += 1
         return target
+
+    async def _ensure_model_loaded(self, target: Engine, model_id: str | None) -> None:
+        """For an APISwapEngine with a load_path, load *model_id* unless it is
+        already loaded. No-op for every other engine (JIT/process engines).
+
+        Caller MUST hold _swap_lock and *target* must already be active."""
+        if not isinstance(target, APISwapEngine):
+            return
+        if not getattr(target.cfg, "load_path", "") or not model_id:
+            return
+        try:
+            already = await target.loaded_model_names()
+        except Exception as exc:  # noqa: BLE001 - probe is best-effort
+            log.warning("%s: could not check loaded models: %s", target.key, exc)
+            already = []
+        if model_id in already:
+            log.debug("%s: model %s already loaded; skip load", target.key, model_id)
+            return
+        await target.load_model(model_id)
 
     async def release(self, engine_key: str) -> None:
         async with self._inflight_cond:
@@ -1030,7 +1259,8 @@ class EngineManager:
                 "base_url": engine.base_url,
             }
             if isinstance(engine, APISwapEngine):
-                entry["loaded_models"] = await engine.loaded_models()
+                # Display names (not unload ids) under the human-facing field.
+                entry["loaded_models"] = await engine.loaded_model_names()
             if isinstance(engine, (Ds4Engine, GenericProcessEngine)):
                 entry["process_running"] = engine.is_running()
             engines[key] = entry

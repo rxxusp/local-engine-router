@@ -6,6 +6,27 @@ until then it is in a `0.x` channel where minor versions may break.
 
 ## [Unreleased]
 
+### Added — v0.3 engine-coverage core (EC1–EC5 + MM4)
+- **Control-call auth headers** — optional `control_headers` on each engine
+  config, applied to the control client only (not user traffic). Unblocks
+  secured TabbyAPI (`x-admin-key`) and LM Studio/LocalAI (`Authorization: Bearer`).
+- **Generic HTTP `load_path`** on `api_swap` engines — explicitly load a model
+  into a running engine on acquire (`load_path`/`load_method`/`load_body`/
+  `load_timeout_s`), skipped when the model is already loaded. Enables
+  explicit-load engines (TabbyAPI, text-generation-webui) config-only.
+- **Loaded-state filtering + id keying** — `loaded_filter` (e.g. `state==loaded`)
+  and `loaded_id_key` (e.g. LM Studio `instance_id`), plus handling of a
+  single-object `loaded_path` response (TabbyAPI `/v1/model`).
+- **Richer readiness probe** — optional `ready_check` (`key==value` or
+  `model:<id>`) beyond HTTP 200, so a false-ready engine (e.g. vLLM `/health`)
+  isn't marked ready before it can serve.
+- **Process-group reaping** — `generic_process` teardown signals the whole
+  process group (`os.killpg`) so forked workers (vLLM/SGLang/Aphrodite/MAX) are
+  reaped, with SIGTERM→SIGKILL escalation + port-close verification retained.
+- **Alias / capability routing** — top-level `aliases` map (`{alias → real id}`);
+  resolved before routing, with the outgoing request body's `model` rewritten to
+  the real id so a client asking for e.g. `gpt-4o-mini` reaches the chosen model.
+
 ## [0.2.0] — 2026-06-02
 Second build-out wave: a generic engine layer, keep-alive on every streaming
 path, packaging + a published Docker image, a hermetic test suite + CI, config
