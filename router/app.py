@@ -4,6 +4,7 @@ Implements the full shared endpoint contract:
 
   GET  /                          tiny HTML status page
   GET  /health                    router liveness (no swap)
+  GET  /metrics                   Prometheus exposition (unauthenticated)
   GET  /status                    EngineManager.status()
   GET  /v1/models                 union of static config + live ollama tags
   POST /v1/chat/completions       }
@@ -20,8 +21,13 @@ Implements the full shared endpoint contract:
             /api/show, /api/pull  }
   POST /admin/swap                proactive engine swap
 
-SSE keep-alive comments are injected for /v1/* streaming endpoints only.
-/api/* streams use application/x-ndjson and MUST NOT get SSE comment lines.
+During an engine swap, streaming responses emit periodic keep-alive frames so
+clients don't hit a TTFB/idle timeout: /v1/* streams (text/event-stream) get SSE
+comment lines (": ...\\n\\n"), while /api/* streams (application/x-ndjson) get a
+bare newline ("\\n") that NDJSON readers skip — /api/* MUST NOT get SSE comment
+lines as they would corrupt the NDJSON stream. Non-streaming requests cannot
+carry keep-alive frames, so their callers must raise the client read-timeout
+above the worst-case swap.
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from . import metrics
 from .config import RouterConfig
 from .engines import EngineError, EngineManager, OllamaEngine
 from .proxy import (
@@ -69,8 +76,9 @@ def sse_error_chunk(exc: Exception) -> bytes:
     return b"data: " + payload.encode() + b"\n\n"
 
 
-# Paths reachable without an API key even when auth is enabled (liveness probes).
-_AUTH_EXEMPT_PATHS = frozenset({"/health"})
+# Paths reachable without an API key even when auth is enabled: liveness probes
+# and the Prometheus scrape endpoint (scrapers must reach /metrics keyless).
+_AUTH_EXEMPT_PATHS = frozenset({"/health", "/metrics"})
 
 
 def _extract_api_key(headers) -> str | None:
@@ -98,6 +106,20 @@ def _error_status_for(exc: Exception) -> int:
     if isinstance(exc, (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError)):
         return 502
     return 502
+
+
+def _find_ollama_engine(manager: EngineManager) -> OllamaEngine | None:
+    """Return the first OllamaEngine in the manager's table, or None.
+
+    The Ollama-capable engine used to be looked up by the literal key
+    "ollama", but with the generic ``engines:`` table a user can key it under
+    any name. Resolve it by type instead so /v1/models tag enrichment and the
+    /api/* passthrough keep working regardless of the configured key.
+    """
+    for engine in manager.engines.values():
+        if isinstance(engine, OllamaEngine):
+            return engine
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +188,12 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         """Router liveness probe. Never triggers a swap."""
         return {"status": "ok"}
 
+    @app.get("/metrics")
+    async def get_metrics() -> Response:
+        """Prometheus exposition. Unauthenticated (exempt from the api-key
+        middleware) so scrapers can reach it without a key."""
+        return Response(content=metrics.render(), media_type=metrics.CONTENT_TYPE)
+
     @app.get("/status")
     async def status(request: Request) -> JSONResponse:
         manager: EngineManager = request.app.state.manager
@@ -225,8 +253,8 @@ def create_app(cfg: RouterConfig) -> FastAPI:
             )
 
         # Live Ollama tags (best-effort; don't fail if ollama is down).
-        ollama_engine = manager.engines.get("ollama")
-        if isinstance(ollama_engine, OllamaEngine):
+        ollama_engine = _find_ollama_engine(manager)
+        if ollama_engine is not None:
             try:
                 tags = await ollama_engine.available_tags()
                 for tag in sorted(tags):
@@ -237,7 +265,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                                 "id": tag,
                                 "object": "model",
                                 "created": _MODELS_CREATED_TS,
-                                "owned_by": "ollama",
+                                "owned_by": ollama_engine.key,
                                 "name": tag,
                             }
                         )
@@ -385,7 +413,10 @@ def create_app(cfg: RouterConfig) -> FastAPI:
 
             return StreamingResponse(gen(), media_type="text/event-stream")
         else:
-            # Non-streaming: acquire -> proxy -> release.
+            # Non-streaming: acquire -> proxy -> release. A single JSON body
+            # cannot carry keep-alive frames, so a long swap blocks until it
+            # completes; non-stream callers MUST set their client read-timeout
+            # above the worst-case swap (~240s for a cold ds4 start).
             engine = None
             try:
                 engine = await manager.acquire(model)
@@ -464,33 +495,96 @@ def create_app(cfg: RouterConfig) -> FastAPI:
 
         fwd_headers = _build_fwd_headers(request)
 
-        engine = None
-        try:
-            engine = await manager.acquire(model)
-        except EngineError as exc:
-            status = _error_status_for(exc)
-            return JSONResponse(_openai_error(str(exc), "engine_error"), status_code=status)
-
-        log.info("api request %s -> %s (stream=%s)", model, engine.key, is_stream)
-        url = upstream_url(engine.base_url, path)
-
         if is_stream:
-            # NDJSON stream — no SSE comment injection.
+            # NDJSON stream with keep-alive during swaps. The StreamingResponse
+            # starts IMMEDIATELY and the acquire happens inside the generator so
+            # a long swap (up to ~240s) doesn't block with zero bytes sent and
+            # time the client out. While the swap is in progress we emit a bare
+            # newline ("\n") as a holding frame: newline-delimited JSON readers
+            # (Ollama/OpenAI-NDJSON clients iterate non-empty lines) simply skip
+            # it. We MUST NOT emit SSE "data:"/comment syntax here — that would
+            # corrupt the NDJSON stream.
+            #
+            # This mirrors the shielded-acquire + finally-release pattern proven
+            # in _handle_v1_post's gen(), including its cancellation/leak-safety.
             async def ndjson_gen() -> "AsyncGenerator[bytes, None]":  # type: ignore[name-defined]
+                acq = asyncio.create_task(manager.acquire(model))
+                engine = None
                 try:
-                    async with client.stream(
-                        request.method, url, content=raw_body, headers=fwd_headers
-                    ) as up:
-                        async for chunk in up.aiter_raw():
-                            yield chunk
-                except httpx.HTTPError as exc:
-                    log.error("upstream stream error on %s: %s", url, exc)
-                    # Can't inject SSE; just end the stream.
+                    # Wait for the engine to be acquired (a swap may be in
+                    # progress), emitting NDJSON-safe holding frames so the
+                    # client doesn't hit a TTFB/idle timeout. acq is shielded,
+                    # so a keepalive timeout never cancels the in-progress swap.
+                    try:
+                        while not acq.done():
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.shield(acq),
+                                    timeout=cfg.swap_keepalive_interval_s,
+                                )
+                            except asyncio.TimeoutError:
+                                if cfg.swap_keepalive_enabled:
+                                    log.debug(
+                                        "keepalive: waiting for swap (model=%s)", model
+                                    )
+                                    # Bare newline: skipped by NDJSON readers.
+                                    yield b"\n"
+                        engine = acq.result()  # raises EngineError on failure
+                    except EngineError as exc:
+                        # Can't inject a JSON error into a half-started NDJSON
+                        # stream without risking client confusion; log and end
+                        # the stream (mirrors the upstream-error handling below).
+                        log.error("acquire failed for %s: %s", model, exc)
+                        return
+
+                    log.info("api stream %s -> %s", model, engine.key)
+                    url = upstream_url(engine.base_url, path)
+                    try:
+                        async with client.stream(
+                            request.method, url, content=raw_body, headers=fwd_headers
+                        ) as up:
+                            async for chunk in up.aiter_raw():
+                                yield chunk
+                    except httpx.HTTPError as exc:
+                        log.error("upstream stream error on %s: %s", url, exc)
+                        # Can't inject SSE; just end the stream.
                 finally:
-                    await manager.release(engine.key)
+                    # Guarantee the in-flight count is released however the
+                    # generator exits: normal end, EngineError, upstream error,
+                    # or client disconnect (CancelledError / GeneratorExit) at
+                    # any point — including mid-swap while emitting keepalives.
+                    if not acq.done():
+                        # Still pending => acquire hasn't incremented in-flight
+                        # yet (the increment is the last, await-free step), so
+                        # cancelling here is leak-free.
+                        acq.cancel()
+                    elif engine is None and not acq.cancelled():
+                        # acquire completed (and incremented) but we were
+                        # cancelled before binding `engine`. Recover it so the
+                        # increment is paired with a release.
+                        try:
+                            engine = acq.result()
+                        except BaseException:
+                            engine = None
+                    if engine is not None:
+                        # shield so a cancellation in flight can't skip release.
+                        await asyncio.shield(manager.release(engine.key))
 
             return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")
         else:
+            # Non-streaming: acquire -> proxy -> release. A single JSON body
+            # cannot carry holding frames, so a long swap blocks until it
+            # completes; non-stream callers MUST set their client read-timeout
+            # above the worst-case swap (~240s for a cold ds4 start).
+            engine = None
+            try:
+                engine = await manager.acquire(model)
+            except EngineError as exc:
+                status = _error_status_for(exc)
+                return JSONResponse(_openai_error(str(exc), "engine_error"), status_code=status)
+
+            log.info("api request %s -> %s (stream=False)", model, engine.key)
+            url = upstream_url(engine.base_url, path)
             try:
                 status, resp_headers, body_bytes = await forward(
                     client, request.method, url, fwd_headers, raw_body
@@ -531,7 +625,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         manager: EngineManager = request.app.state.manager
         client: httpx.AsyncClient = request.app.state.client
 
-        ollama_engine = manager.engines.get("ollama")
+        ollama_engine = _find_ollama_engine(manager)
         if ollama_engine is None:
             return JSONResponse(
                 _openai_error("ollama engine is disabled", "engine_error"),
