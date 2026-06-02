@@ -4,6 +4,12 @@
 > commitment. Priorities and scope will change. Informed by a competitive
 > survey (May 2026) of llama-swap, LocalAI, GPUStack, llama.cpp router mode,
 > LiteLLM, vLLM/SGLang/TabbyAPI, and others.
+>
+> **This is the v0.2 roadmap (delivered as v0.2.0).** For the next milestone —
+> config-only support for all the major local engines + the "make it better"
+> work — see [`ROADMAP-v0.3-engine-coverage.md`](ROADMAP-v0.3-engine-coverage.md).
+> For the at-a-glance done/next picture and branch/PR map, see
+> [`../STATUS.md`](../STATUS.md).
 
 ## What this is
 
