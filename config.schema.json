@@ -51,6 +51,10 @@
       "type": "number",
       "default": 15.0
     },
+    "aliases": {
+      "type": "object",
+      "additionalProperties": true
+    },
     "ds4": {
       "type": "object",
       "properties": {
@@ -93,6 +97,10 @@
         "log_file": {
           "type": "string",
           "default": "/home/grahamfm/llm-router/logs/ds4-server.log"
+        },
+        "control_headers": {
+          "type": "object",
+          "additionalProperties": true
         }
       },
       "additionalProperties": true
@@ -123,6 +131,10 @@
         "tags_cache_ttl_s": {
           "type": "number",
           "default": 30.0
+        },
+        "control_headers": {
+          "type": "object",
+          "additionalProperties": true
         }
       },
       "additionalProperties": true
@@ -177,6 +189,10 @@
               "log_file": {
                 "type": "string",
                 "default": "/home/grahamfm/llm-router/logs/ds4-server.log"
+              },
+              "control_headers": {
+                "type": "object",
+                "additionalProperties": true
               }
             },
             "additionalProperties": true,
@@ -213,6 +229,10 @@
               "tags_cache_ttl_s": {
                 "type": "number",
                 "default": 30.0
+              },
+              "control_headers": {
+                "type": "object",
+                "additionalProperties": true
               }
             },
             "additionalProperties": true,
@@ -265,6 +285,10 @@
                 "type": "string",
                 "default": "/health"
               },
+              "ready_check": {
+                "type": "string",
+                "default": ""
+              },
               "start_timeout_s": {
                 "type": "number",
                 "default": 300.0
@@ -296,6 +320,10 @@
                     "type": "null"
                   }
                 ]
+              },
+              "control_headers": {
+                "type": "object",
+                "additionalProperties": true
               }
             },
             "additionalProperties": true,
@@ -321,6 +349,10 @@
                 "type": "string",
                 "default": "/v1/models"
               },
+              "ready_check": {
+                "type": "string",
+                "default": ""
+              },
               "unload_path": {
                 "type": "string",
                 "default": ""
@@ -332,6 +364,22 @@
               "unload_body": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "load_path": {
+                "type": "string",
+                "default": ""
+              },
+              "load_method": {
+                "type": "string",
+                "default": "POST"
+              },
+              "load_body": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "load_timeout_s": {
+                "type": "number",
+                "default": 120.0
               },
               "loaded_path": {
                 "anyOf": [
@@ -351,6 +399,14 @@
                 "type": "string",
                 "default": "name"
               },
+              "loaded_filter": {
+                "type": "string",
+                "default": ""
+              },
+              "loaded_id_key": {
+                "type": "string",
+                "default": ""
+              },
               "unload_timeout_s": {
                 "type": "number",
                 "default": 60.0
@@ -368,6 +424,10 @@
               "tags_cache_ttl_s": {
                 "type": "number",
                 "default": 30.0
+              },
+              "control_headers": {
+                "type": "object",
+                "additionalProperties": true
               }
             },
             "additionalProperties": true,

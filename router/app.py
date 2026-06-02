@@ -108,6 +108,25 @@ def _error_status_for(exc: Exception) -> int:
     return 502
 
 
+def _resolve_alias_and_rewrite(
+    manager: EngineManager, model: str, body: dict[str, Any], raw_body: bytes
+) -> tuple[str, bytes]:
+    """Resolve *model* through the alias map; if it is an alias, rewrite the
+    request body's "model" to the REAL id and re-serialize.
+
+    Returns ``(real_model_id, raw_body)``. When *model* is not an alias the
+    inputs are returned unchanged (no re-serialization), so non-aliased
+    requests are byte-for-byte identical to before. Routing always uses the
+    real id, and the upstream engine must see the real id in the body — never
+    the alias."""
+    real = manager.resolve_model_id(model)
+    if real == model:
+        return model, raw_body
+    log.debug("alias %s -> %s; rewriting body model", model, real)
+    body["model"] = real
+    return real, json.dumps(body).encode()
+
+
 def _find_ollama_engine(manager: EngineManager) -> OllamaEngine | None:
     """Return the first OllamaEngine in the manager's table, or None.
 
@@ -346,6 +365,10 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 status_code=400,
             )
 
+        # Resolve a capability/alias to the real model id and rewrite the body
+        # so the upstream sees the real id (no-op + unchanged bytes if not an alias).
+        model, raw_body = _resolve_alias_and_rewrite(manager, model, body, raw_body)
+
         is_stream: bool = bool(body.get("stream", False))
         fwd_headers = _build_fwd_headers(request)
 
@@ -398,8 +421,8 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                     # any point — including mid-swap while emitting keepalives.
                     if not acq.done():
                         # Still pending => acquire hasn't incremented in-flight
-                        # yet (the increment is the last, await-free step), so
-                        # cancelling here is leak-free.
+                        # yet (the increment is the final step, after any
+                        # explicit model-load), so cancelling here is leak-free.
                         acq.cancel()
                     elif engine is None and not acq.cancelled():
                         # acquire completed (and incremented) but we were
@@ -492,6 +515,10 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 status_code=400,
             )
 
+        # Resolve a capability/alias to the real model id and rewrite the body
+        # so the upstream sees the real id (no-op + unchanged bytes if not an alias).
+        model, raw_body = _resolve_alias_and_rewrite(manager, model, body, raw_body)
+
         # Ollama streams by default; only non-stream if explicitly false.
         is_stream: bool = body.get("stream", True) is not False
 
@@ -557,8 +584,8 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                     # any point — including mid-swap while emitting keepalives.
                     if not acq.done():
                         # Still pending => acquire hasn't incremented in-flight
-                        # yet (the increment is the last, await-free step), so
-                        # cancelling here is leak-free.
+                        # yet (the increment is the final step, after any
+                        # explicit model-load), so cancelling here is leak-free.
                         acq.cancel()
                     elif engine is None and not acq.cancelled():
                         # acquire completed (and incremented) but we were

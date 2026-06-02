@@ -110,6 +110,9 @@ class Ds4Config:
     stop_timeout_s: float = 45.0
     # Where ds4-server stdout/stderr is appended when control="process".
     log_file: str = "/home/grahamfm/llm-router/logs/ds4-server.log"
+    # Optional headers sent on every control/health call the router makes to
+    # this engine (NOT user traffic). Default {} = unchanged (no auth header).
+    control_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -124,6 +127,9 @@ class OllamaConfig:
     systemd_unit: str = "ollama.service"
     # TTL (seconds) for the cached /api/tags lookup used by routing fallback.
     tags_cache_ttl_s: float = 30.0
+    # Optional headers on the control client (e.g. a Bearer key if Ollama is
+    # fronted by an authenticating reverse proxy). Default {} = none.
+    control_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -146,8 +152,22 @@ class GenericProcessConfig:
     cwd: str | None = None
     # Readiness probe path appended to base_url (e.g. /health, /v1/models).
     ready_path: str = "/health"
+    # Optional richer readiness assertion beyond "HTTP 200". Two forms:
+    #   "key==value"  -> the JSON response (or any nested object/list-of-objects)
+    #                    must contain that key set to that value
+    #                    (e.g. "status==ok" for llama-server's /health body).
+    #   "model:<id>"  -> the model id <id> must appear in the response's model
+    #                    list (so /v1/models-style readiness waits for the model
+    #                    to actually be servable, not just the server to answer).
+    #                    Use this for vLLM, whose /health returns an EMPTY 200
+    #                    body before the model can serve — set ready_path=/v1/models
+    #                    and ready_check="model:<id>" to avoid a false-ready swap.
+    # Default "" = current behaviour: HTTP 200 is sufficient.
+    ready_check: str = ""
     # Seconds to wait for a cold start to answer ready_path with HTTP 200.
-    # vLLM/SGLang can take minutes; default generously.
+    # vLLM/SGLang can take minutes; default generously. NOTE: SGLang with
+    # torch.compile enabled can take >=600s on a cold start — raise this
+    # per-engine when running such backends.
     start_timeout_s: float = 300.0
     # Signal used to ask the process group to stop (name or number; default SIGTERM).
     stop_signal: str = "SIGTERM"
@@ -160,6 +180,9 @@ class GenericProcessConfig:
     process_pattern: str | None = None
     # Where the launched process' stdout/stderr is appended (optional).
     log_file: str | None = None
+    # Optional headers sent on every control/health/readiness call the router
+    # makes to this engine (NOT user traffic). Default {} = unchanged.
+    control_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -174,6 +197,10 @@ class ApiSwapConfig:
     base_url: str = ""
     # Readiness probe path (does not load a model).
     health_path: str = "/v1/models"
+    # Optional richer readiness assertion beyond "HTTP 200" (same forms as
+    # GenericProcessConfig.ready_check: "key==value" or "model:<id>"). Applied
+    # to the health_path response. Default "" = HTTP 200 is sufficient.
+    ready_check: str = ""
     # Endpoint + method + body used to unload / free VRAM.
     unload_path: str = ""
     unload_method: str = "POST"
@@ -181,18 +208,45 @@ class ApiSwapConfig:
     # with each currently-loaded model name (when a list-loaded probe exists);
     # otherwise the body is sent once as-is.
     unload_body: dict[str, Any] = field(default_factory=dict)
+    # Optional explicit per-model load endpoint (for engines that require a model
+    # to be loaded before it can serve, e.g. TabbyAPI / text-generation-webui).
+    # When set, the router loads the requested model on acquire (after the engine
+    # is active) if it is not already loaded. Default "" = no explicit load
+    # (JIT engines like Ollama load on first request and need nothing here).
+    load_path: str = ""
+    load_method: str = "POST"
+    # JSON body sent to load_path. {model} in any string value is substituted
+    # with the requested model id (same templating as unload_body).
+    load_body: dict[str, Any] = field(default_factory=dict)
+    # Seconds to wait for a single explicit load to complete (cold loads of a
+    # large model can be slow; default generously).
+    load_timeout_s: float = 120.0
     # Optional probe that lists currently-loaded models, so we can unload each
     # and confirm VRAM is released. path + the JSON key holding the list of
     # entries + the per-entry key holding the model name.
     loaded_path: str | None = None
     loaded_models_key: str = "models"
     loaded_name_key: str = "name"
+    # Optional "key==value" filter applied to each loaded_path entry so only
+    # ACTUALLY-loaded models are returned (e.g. "state==loaded" for engines that
+    # list known-but-unloaded models too). Default "" = no filter (every entry).
+    loaded_filter: str = ""
+    # Optional per-entry field whose value is the UNLOAD identifier (distinct
+    # from the display name), e.g. "instance_id" for LM Studio. When set,
+    # loaded_models() returns these ids and {model} unload substitution uses
+    # them. Default "" = key by loaded_name_key (the display name).
+    loaded_id_key: str = ""
     # Seconds to wait for loaded models to clear after issuing unloads.
     unload_timeout_s: float = 60.0
     # Optional systemd unit to (best-effort) start if the API is unreachable.
     systemd_unit: str | None = None
     # TTL (seconds) for any cached list lookups (e.g. /v1/models for routing).
     tags_cache_ttl_s: float = 30.0
+    # Optional headers sent on every control/health/load/unload/loaded call the
+    # router makes to this engine (NOT user traffic) — e.g. an x-admin-key for a
+    # secured TabbyAPI, or an Authorization bearer for LM Studio/LocalAI.
+    # Default {} = unchanged (no auth header on control calls).
+    control_headers: dict[str, str] = field(default_factory=dict)
 
 
 # Maps an engine ``type`` to the dataclass holding its parameters.
@@ -261,6 +315,13 @@ class RouterConfig:
     # type, and ds4:/ollama: are ignored.
     engines: list[EngineSpec] = field(default_factory=list)
     models: list[ModelSpec] = field(default_factory=list)
+    # Optional alias map {alias -> real model id}. A request for an alias routes
+    # to the real model's engine, and the outgoing body's "model" is rewritten
+    # to the real id before forwarding. Targets must resolve to a known model id
+    # or a configured engine's model (unknown live-Ollama targets are allowed
+    # with a warning). Alias->alias chains and malformed entries are rejected.
+    # Default {} = no aliases.
+    aliases: dict[str, str] = field(default_factory=dict)
 
     # Convenience -------------------------------------------------------- #
     def engine_keys(self) -> list[str]:
@@ -450,7 +511,53 @@ def load_config(path: str) -> RouterConfig:
                 f"model {spec.id!r} references unknown engine {spec.engine!r} "
                 f"(configured engines: {sorted(valid_engines)})"
             )
+
+    _validate_aliases(cfg)
     return cfg
+
+
+def _validate_aliases(cfg: RouterConfig) -> None:
+    """Validate cfg.aliases ({alias -> real model id}).
+
+    Hard-fails (ConfigError) on a malformed entry or an alias whose target is
+    itself another alias (no chains). Soft-warns when a target does not resolve
+    to a known model id — live Ollama tags resolve at runtime, so an unknown
+    target is not necessarily an error.
+    """
+    aliases = cfg.aliases or {}
+    if not isinstance(aliases, dict):
+        raise ConfigError("'aliases' must be a mapping of alias -> real model id")
+
+    known_ids = {m.id for m in cfg.models}
+    alias_keys = set(aliases.keys())
+    for alias, target in aliases.items():
+        if not isinstance(alias, str) or not alias:
+            raise ConfigError(f"alias key {alias!r} must be a non-empty string")
+        if not isinstance(target, str) or not target:
+            raise ConfigError(
+                f"alias {alias!r} target must be a non-empty model id string"
+            )
+        if target == alias:
+            raise ConfigError(f"alias {alias!r} points at itself")
+        if alias in known_ids:
+            raise ConfigError(
+                f"alias {alias!r} collides with a configured model id; an alias "
+                f"key must not shadow a real model (it would silently rewrite "
+                f"every request for that model to {target!r})"
+            )
+        if target in alias_keys:
+            raise ConfigError(
+                f"alias {alias!r} -> {target!r} is a chain "
+                f"(its target is itself an alias); aliases must point at a "
+                f"real model id, not another alias"
+            )
+        if target not in known_ids:
+            log.warning(
+                "alias %r -> %r: target is not a known model id "
+                "(ok if it resolves at runtime, e.g. a live Ollama tag)",
+                alias,
+                target,
+            )
 
 
 def build_model_index(cfg: RouterConfig) -> dict[str, ModelSpec]:

@@ -23,7 +23,7 @@ from router.app import create_app
 from router.config import Ds4Config, ModelSpec, OllamaConfig, RouterConfig
 
 
-def _app_config(mock_base: str, *, api_keys=None) -> RouterConfig:
+def _app_config(mock_base: str, *, api_keys=None, aliases=None) -> RouterConfig:
     """Config whose ds4 + ollama both point at the mock upstream's base_url.
 
     The legacy ds4:/ollama: sections build a Ds4Engine + OllamaEngine; keeping
@@ -34,6 +34,7 @@ def _app_config(mock_base: str, *, api_keys=None) -> RouterConfig:
         host="127.0.0.1",
         port=8077,
         api_keys=list(api_keys or []),
+        aliases=dict(aliases or {}),
         state_file="/tmp/llm-router-test-state.json",
         drain_timeout_s=0.5,
         swap_memory_settle_timeout_s=0.1,
@@ -262,3 +263,54 @@ async def test_auth_rejects_wrong_key(mock_upstream):
             "/v1/models", headers={"Authorization": "Bearer wrong-key"}
         )
         assert r.status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# MM4: an alias routes to the real model AND the outgoing body's model is
+# rewritten to the real id (the mock echoes body["model"], proving the rewrite).
+# --------------------------------------------------------------------------- #
+async def test_alias_routes_and_rewrites_body_model(mock_upstream):
+    cfg = _app_config(mock_upstream.base_url, aliases={"gpt-4o": "deepseek-v4-flash"})
+    async with _client_for(cfg) as (client, mgr):
+        r = await client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r.status_code == 200
+        # The upstream echoed the model it RECEIVED -> must be the real id, not
+        # the alias, proving the body was rewritten before forwarding.
+        assert r.json()["model"] == "deepseek-v4-flash"
+        # And the alias routed to the real model's engine.
+        assert mgr.active_engine == "ds4"
+
+
+async def test_alias_rewrites_body_on_api_endpoint(mock_upstream):
+    """The /api/* path (Ollama-native) rewrites the alias in the NDJSON body too."""
+    cfg = _app_config(mock_upstream.base_url, aliases={"chat": "qwen2.5:3b"})
+    async with _client_for(cfg) as (client, mgr):
+        chunks: list[bytes] = []
+        async with client.stream(
+            "POST",
+            "/api/chat",
+            json={"model": "chat", "messages": [{"role": "user", "content": "y"}]},
+        ) as resp:
+            assert resp.status_code == 200
+            async for chunk in resp.aiter_bytes():
+                chunks.append(chunk)
+        joined = b"".join(chunks)
+        # The mock /api/chat echoes the received model into each NDJSON line.
+        assert b'"model":"qwen2.5:3b"' in joined
+        assert b'"model":"chat"' not in joined
+        assert mgr.active_engine == "ollama"
+
+
+async def test_non_alias_request_body_unchanged(mock_upstream):
+    """A non-aliased model id is forwarded unchanged (model echoed verbatim)."""
+    cfg = _app_config(mock_upstream.base_url, aliases={"gpt-4o": "deepseek-v4-flash"})
+    async with _client_for(cfg) as (client, _):
+        r = await client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4-flash", "messages": []},
+        )
+        assert r.status_code == 200
+        assert r.json()["model"] == "deepseek-v4-flash"
