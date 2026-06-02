@@ -58,8 +58,63 @@ ollama:
   systemd_unit: ollama.service
   tags_cache_ttl_s: 30.0
 
-# Static model->engine registry. The `id` must match what clients send.
-# Unknown ids fall back to a live Ollama tag lookup at request time.
+# --- Generic engine table (alternative to the ds4:/ollama: sections above) --
+# OPTIONAL. The two `ds4:`/`ollama:` sections above are the legacy, always-
+# available form. To add *new* engines with config only (no Python), use this
+# top-level `engines:` table instead. IMPORTANT: when `engines:` is present it
+# is the SOLE source of engines and the `ds4:`/`ollama:` sections above are
+# IGNORED — so the block below is commented out by default. Each entry is
+# `engine_key -> { type, ... }`; `type` is one of: ds4, ollama,
+# generic_process, api_swap. Models then reference these keys via `engine:`.
+#
+# engines:
+#   # A local server the router launches + supervises (llama.cpp/llama-server,
+#   # llamafile, vLLM, SGLang, Aphrodite). Required: base_url + start_cmd.
+#   llamacpp:
+#     type: generic_process
+#     enabled: true
+#     base_url: http://127.0.0.1:8080
+#     start_cmd:                       # argv list (no shell) or a single string
+#       - /usr/local/bin/llama-server
+#       - -m
+#       - /models/qwen2.5-7b-instruct-q4_k_m.gguf
+#       - --port
+#       - "8080"
+#     # env: { CUDA_VISIBLE_DEVICES: "0" }   # extra env (merged over os.environ)
+#     # cwd: /opt/llama.cpp                  # working dir (optional)
+#     ready_path: /health                    # polled for HTTP 200 until ready
+#     start_timeout_s: 300                   # vLLM/SGLang can take minutes
+#     stop_signal: SIGTERM                   # SIGTERM->SIGKILL + port-close check
+#     stop_timeout_s: 30
+#     # process_pattern: llama-server        # pgrep -f to reap strays we don't own
+#     # log_file: ./logs/llamacpp.log
+#
+#   # An engine whose models load/unload over HTTP (router owns no process),
+#   # e.g. TabbyAPI. Required: base_url. unload_path frees VRAM on swap-away.
+#   tabby:
+#     type: api_swap
+#     enabled: true
+#     base_url: http://127.0.0.1:5000
+#     health_path: /v1/model                 # readiness probe (loads nothing)
+#     unload_path: /v1/model/unload          # called to release the GPU
+#     unload_method: POST
+#     # unload_body: {}                       # {model} in any string is substituted
+#     loaded_path: /v1/model                 # lists loaded models, to confirm unload
+#     loaded_models_key: data                # JSON key holding the list
+#     loaded_name_key: id                    # per-entry key holding the model name
+#     unload_timeout_s: 60
+#     # systemd_unit: tabbyapi.service        # best-effort start if unreachable
+#     tags_cache_ttl_s: 30
+#
+# models:
+#   - id: qwen2.5-7b-instruct
+#     engine: llamacpp
+#   - id: my-tabby-model
+#     engine: tabby
+
+# Static model->engine registry. The `id` must match what clients send, and
+# `engine` must name a configured engine (ds4/ollama here, or a key from the
+# `engines:` table above). Unknown ids fall back to a live Ollama tag lookup.
 models:
   - id: deepseek-v4-flash
     engine: ds4

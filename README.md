@@ -1,14 +1,77 @@
 # local-engine-router
 
-A lightweight OpenAI- and Ollama-compatible reverse proxy that sits in front of
-`ds4` and `Ollama` on a DGX Spark (GB10, 128 GB unified memory). Because the
-two engines share one physical memory pool, only one heavy engine can hold the
-GPU at a time. The router enforces mutual exclusion, swapping automatically when
-the requested model lives on the other engine.
+[![CI](https://github.com/rxxusp/local-engine-router/actions/workflows/ci.yml/badge.svg)](https://github.com/rxxusp/local-engine-router/actions/workflows/ci.yml)
+
+**On memory-constrained, unified-memory hardware, only one heavy LLM engine can
+hold the GPU at a time.** local-engine-router is a single-port, OpenAI- and
+Ollama-compatible reverse proxy that reads each request's `model` field, figures
+out which local engine owns it, and **swaps engines on demand** — draining
+in-flight requests, stopping whatever holds the GPU, waiting for the kernel to
+reclaim its memory, then starting the target — all while keep-alive frames hold
+streaming clients open through the (sometimes minutes-long) cold start. The
+proxy itself is **pure Python and uses no GPU**.
+
+Built and verified on a DGX Spark (GB10, 128 GB unified CPU+GPU memory), where
+DeepSeek-V4-Flash alone uses ~81 GB and running two heavy engines at once OOMs.
+
+### What's different here
+
+The general space (llama-swap, LocalAI, GPUStack, …) is crowded; this targets
+the **memory-constrained unified-memory** niche (GB10 / Apple Silicon) and does
+four things no maintained tool does today:
+
+1. **Explicit kernel memory-settle wait.** After freeing an engine the router
+   polls `/proc/meminfo` `MemAvailable` until it plateaus *before* starting the
+   next engine — so the incoming model's pre-flight memory check doesn't fail on
+   pages the kernel hasn't reclaimed yet (on a GB10, ~81 GB takes a few seconds).
+2. **Manages engines it didn't spawn.** It can drive a `systemctl --user` unit
+   with `Restart=always` (a plain SIGTERM would just respawn) — structurally
+   impossible with a pure `cmd:`-launches-the-process model.
+3. **Native Ollama `/api/*` on a swap proxy.** Both the OpenAI `/v1/*` surface
+   and Ollama-native `/api/*` are first-class and trigger swaps.
+4. **Upstream-independent keep-alive** during long cold starts — on **both**
+   `/v1/*` SSE streams and `/api/*` NDJSON streams.
 
 > The Python package is `router` and the systemd unit is `llm-router`; the
 > project/repo is **local-engine-router**. Licensed **MIT** (attribution to
 > `rxxusp`). See [`roadmap/ROADMAP.md`](roadmap/ROADMAP.md) for where this is headed.
+
+## Install
+
+The router is pure Python (`fastapi`, `uvicorn`, `httpx`, `pyyaml`) and needs no
+GPU. Python ≥ 3.10.
+
+```bash
+# From a checkout (editable for dev): installs console scripts llm-router + routerctl
+pip install .
+
+# Or isolated, via pipx:
+pipx install .
+
+# Then run it:
+cp config.example.yaml config.yaml       # edit for your machine
+llm-router --config config.yaml          # console script
+python3 -m router --config config.yaml   # equivalent module form
+# or, for the systemd user service: bash deploy/install.sh
+```
+
+### Docker (ghcr.io)
+
+A pure-Python image (`python:3.12-slim`, **no CUDA**) is published to the GitHub
+Container Registry on every `v*` tag / release:
+
+```bash
+docker run --rm -p 8077:8077 \
+  -v "$PWD/config.yaml:/app/config.yaml" \
+  ghcr.io/rxxusp/local-engine-router:latest
+```
+
+The container reads `$ROUTER_CONFIG` (defaults to `/app/config.yaml`); mount
+your config there. **Caveat:** process-control engines (`ds4` via
+`systemd-user`/`process`, and `generic_process`) reach into the host's
+process/service tree, which a container cannot see — run the router **on the
+host** for those. The image is appropriate for fronting `api_swap`/remote
+engines it only talks to over HTTP.
 
 ## Quick start
 
@@ -63,7 +126,8 @@ in `config.yaml` — and then set `api_keys` (see below) or rely on a host firew
                        at a time (GB10 unified memory pool)
 
   swap: drain in-flight → stop other engine → wait for memory to settle → start target
-  streaming clients stay alive via SSE ": keepalive" comments during the wait
+  streaming clients stay alive during the wait: ": keepalive" SSE comments on
+  /v1/* and bare-newline holding frames on /api/* NDJSON
 ```
 
 
@@ -110,11 +174,41 @@ router waits for it to settle before loading the incoming model.
       - Ollama: if not answering, try `systemctl start ollama.service` and poll
         `GET /api/tags` for up to 20 s.
    e. Mark `active_engine`, persist `state.json`, release the swap lock.
-5. While the swap is in progress, streaming clients receive SSE `": keepalive"`
-   comment lines every `swap_keepalive_interval_s` (default 5 s) so they do not
-   hit a first-token timeout.
+5. While the swap is in progress, streaming clients receive a keep-alive frame
+   every `swap_keepalive_interval_s` (default 5 s) so they do not hit a
+   first-token timeout: `/v1/*` SSE streams get `": keepalive"` comment lines,
+   and `/api/*` NDJSON streams get a bare newline that NDJSON readers skip.
+   Non-streaming requests cannot carry a holding frame and block for the whole
+   swap — see [Keep-alive during swaps](#keep-alive-during-swaps).
 6. The request is counted in-flight on the new engine and forwarded. On response
    completion (or error), `release()` decrements the counter.
+
+
+## Keep-alive during swaps
+
+A swap can take a while — up to `start_timeout_s` (240 s for a cold ds4 start,
+and `generic_process` engines like vLLM/SGLang can take minutes). To stop
+clients hitting a first-token / idle timeout while they wait, the router holds
+**streaming** responses open with periodic keep-alive frames. The streaming
+response starts immediately and the engine is acquired *inside* the response
+generator, so a long cold start never blocks with zero bytes sent.
+
+- **`/v1/*` streaming** (`stream: true`, `text/event-stream`): SSE comment lines
+  `": keepalive (swapping engines)\n\n"` every `swap_keepalive_interval_s`. SSE
+  comments are ignored by every compliant SSE client.
+- **`/api/*` NDJSON** (Ollama streams by default; `application/x-ndjson`): a bare
+  newline `"\n"` every interval, which newline-delimited-JSON readers skip.
+  SSE `data:`/comment syntax is deliberately **not** emitted here — it would
+  corrupt the NDJSON stream.
+
+Set `swap_keepalive_enabled: false` to turn the frames off, or tune the cadence
+with `swap_keepalive_interval_s`.
+
+**Non-streaming caveat.** A single non-streaming JSON response has nowhere to put
+a holding frame, so non-stream requests (`stream: false` on either surface)
+**block for the entire swap**. Such callers MUST raise their client read-timeout
+above the worst-case swap (≈240 s for a cold ds4 start). The router's own
+upstream read timeout is unbounded; only `upstream_connect_timeout_s` is bounded.
 
 
 ## Endpoint reference
@@ -123,6 +217,7 @@ router waits for it to settle before loading the incoming model.
 |--------|------|-----------|
 | GET | `/` | Small HTML status page |
 | GET | `/health` | `{"status":"ok"}` — router liveness; never triggers a swap |
+| GET | `/metrics` | Prometheus text exposition (see [Metrics](#metrics)). Unauthenticated even when `api_keys` are set, so scrapers reach it keyless. |
 | GET | `/status` | Full status dict: active engine, last swap, per-engine state, model list |
 | GET | `/v1/models` | OpenAI model list: union of static registry + live Ollama tags, deduped. No swap; works even if engines are down. |
 | POST | `/v1/chat/completions` | OpenAI chat; routed by `body.model` |
@@ -135,7 +230,7 @@ router waits for it to settle before loading the incoming model.
 | POST | `/api/embeddings` | Ollama-native embeddings; routed by `body.model` |
 | POST | `/api/embed` | Ollama-native embed; routed by `body.model` |
 | GET/POST | `/api/tags`, `/api/ps`, `/api/version`, `/api/show`, `/api/pull`, `/api/*` | Passthrough to Ollama, no swap (management/catalog) |
-| POST | `/admin/swap` | Body: `{"model":"<id>"}` or `{"engine":"ds4"\|"ollama"}`. Proactive swap; returns `status()`. 400 if neither field. |
+| POST | `/admin/swap` | Body: `{"model":"<id>"}` or `{"engine":"<engine_key>"}`. Proactive swap; returns `status()`. 400 if neither field. |
 
 
 ## Config reference (`config.yaml`)
@@ -150,8 +245,8 @@ Top-level keys:
 | `log_level` | `INFO` | Python log level |
 | `log_file` | `logs/router.log` | Rotating log (5 MB × 3 backups) |
 | `state_file` | `state.json` | Persisted active-engine snapshot |
-| `swap_keepalive_enabled` | `true` | Emit SSE keepalive during swaps |
-| `swap_keepalive_interval_s` | `5.0` | Seconds between keepalive comments |
+| `swap_keepalive_enabled` | `true` | Emit keep-alive frames to streaming clients during swaps (SSE on `/v1/*`, NDJSON newline on `/api/*`) |
+| `swap_keepalive_interval_s` | `5.0` | Seconds between keep-alive frames |
 | `drain_timeout_s` | `30.0` | Max wait for in-flight requests before stopping an engine |
 | `swap_memory_settle_timeout_s` | `25.0` | Max wait for freed memory to be reclaimed before starting the next engine (ends early once it plateaus) |
 | `upstream_connect_timeout_s` | `15.0` | Connect timeout to backends (read is unbounded) |
@@ -182,17 +277,145 @@ Top-level keys:
 | `systemd_unit` | `ollama.service` | Unit to start if Ollama is not answering |
 | `tags_cache_ttl_s` | `30.0` | TTL for the live Ollama tag cache used in routing |
 
+### Generic `engines:` table (adding engines with config only)
+
+The `ds4:`/`ollama:` sections above are the legacy, always-available form. To
+add **new** engines without writing any Python, use the optional top-level
+`engines:` table instead — a mapping of `engine_key -> { type, ... }`. **When
+`engines:` is present it is the sole source of engines and the `ds4:`/`ollama:`
+sections are ignored**; when it is absent the router builds `ds4` + `ollama`
+from those sections exactly as before. `type` is one of `ds4`, `ollama`,
+`generic_process`, `api_swap`, and `models[].engine` then references the keys
+you define here.
+
+Worked example — one engine of each of the four types:
+
+```yaml
+engines:
+  # 1. bespoke ds4 escape hatch (systemctl --user lifecycle)
+  ds4:
+    type: ds4
+    base_url: http://127.0.0.1:8099
+    systemd_user_unit: ds4.service
+
+  # 2. Ollama (an api_swap preset: /api/ps, /api/tags, keep_alive:0)
+  ollama:
+    type: ollama
+    base_url: http://127.0.0.1:11434
+
+  # 3. a local server the router launches + supervises (llama.cpp here)
+  llamacpp:
+    type: generic_process
+    base_url: http://127.0.0.1:8080
+    start_cmd: ["/usr/local/bin/llama-server", "-m", "/models/foo.gguf", "--port", "8080"]
+    ready_path: /health
+    start_timeout_s: 300
+
+  # 4. an HTTP load/unload engine the router never spawns (TabbyAPI here)
+  tabby:
+    type: api_swap
+    base_url: http://127.0.0.1:5000
+    health_path: /v1/model
+    unload_path: /v1/model/unload
+    loaded_path: /v1/model
+    loaded_models_key: data
+    loaded_name_key: id
+
+models:
+  - { id: deepseek-v4-flash,     engine: ds4 }
+  - { id: qwen3.6-uncensored:27b, engine: ollama }
+  - { id: qwen2.5-7b-instruct,   engine: llamacpp }
+  - { id: my-tabby-model,         engine: tabby }
+```
+
+Common keys for every `engines:` entry:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `type` | — (required) | One of `ds4`, `ollama`, `generic_process`, `api_swap` |
+| `enabled` | `true` | Skip building this engine when `false` |
+| `base_url` | depends on type | How the router reaches the engine |
+
+`type: generic_process` — a local server the router launches and supervises
+(llama.cpp/llama-server, llamafile, vLLM, SGLang, Aphrodite):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `base_url` | `""` | **Required.** Base URL the router reaches the server on |
+| `start_cmd` | `[]` | **Required.** Launch command: an argv list (run without a shell) or a string (split with `shlex`) |
+| `env` | `{}` | Extra environment variables merged over `os.environ` |
+| `cwd` | `null` | Working directory for the launched process |
+| `ready_path` | `/health` | Path polled for HTTP 200 until ready |
+| `start_timeout_s` | `300.0` | Max wait for a cold start to answer `ready_path` (vLLM/SGLang take minutes) |
+| `stop_signal` | `SIGTERM` | Signal sent to the process group to stop it (name or number) |
+| `stop_timeout_s` | `30.0` | Grace before escalating to SIGKILL; also the budget for the port to confirm closed |
+| `process_pattern` | `null` | Optional `pgrep -f` pattern to find/kill strays the router didn't track |
+| `log_file` | `null` | Where the launched process' stdout/stderr is appended |
+
+`type: api_swap` — an engine whose models load/unload over HTTP (the router owns
+no process; covers TabbyAPI):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `base_url` | `""` | **Required.** Base URL the router reaches the engine on |
+| `health_path` | `/v1/models` | Readiness probe path (must not load a model) |
+| `unload_path` | `""` | Endpoint called to unload / free VRAM (no-op if empty) |
+| `unload_method` | `POST` | HTTP method for `unload_path` |
+| `unload_body` | `{}` | JSON body sent to `unload_path`; `{model}` in any string value is substituted per loaded model |
+| `loaded_path` | `null` | Optional probe listing currently-loaded models (used to confirm VRAM released and for routing) |
+| `loaded_models_key` | `models` | JSON key in the `loaded_path` response holding the list of entries |
+| `loaded_name_key` | `name` | Per-entry key holding the model name |
+| `unload_timeout_s` | `60.0` | Max wait for loaded models to clear after issuing unloads |
+| `systemd_unit` | `null` | Optional unit to best-effort start if the API is unreachable |
+| `tags_cache_ttl_s` | `30.0` | TTL for cached list lookups used in routing |
+
+`type: ds4` and `type: ollama` accept the same keys as the legacy `ds4:` and
+`ollama:` sections documented above.
+
 `models` list entries:
 
 | Key | Required | Description |
 |-----|----------|-------------|
 | `id` | yes | Exact string sent in the `model` field by clients |
-| `engine` | yes | `"ds4"` or `"ollama"` |
+| `engine` | yes | A configured engine key (`ds4`/`ollama`, or any key from the `engines:` table) |
 | `display_name` | no | Human-readable name (defaults to `id`) |
 | `context_length` | no | Context window in tokens (default 131072) |
 
 Models not listed in `config.yaml` are still routed correctly if they exist as
 live Ollama tags (the router caches `/api/tags` for `tags_cache_ttl_s` seconds).
+
+### Validating your config
+
+Config problems are surfaced with actionable messages (an unknown engine
+`type`, a missing required field, a duplicate engine key, or a `model.engine`
+that names no configured engine raise a `ConfigError`; soft issues such as a
+missing `serve_script` are logged as warnings):
+
+```bash
+# Load + validate, print "OK ..." or the error; non-zero exit on failure.
+python3 -m router --check-config --config config.yaml
+
+# Print the JSON Schema (draft 2020-12) for the config.
+python3 -m router --print-schema
+```
+
+A generated [`config.schema.json`](config.schema.json) ships in the repo — point
+your editor's YAML language server at it for autocomplete and inline validation.
+
+### Metrics
+
+`GET /metrics` exposes Prometheus text exposition (format v0.0.4). It is
+**unauthenticated** even when `api_keys` are set (exempt from the auth
+middleware) so scrapers reach it without a key. No new dependency — the
+exposition is hand-rolled. Series:
+
+| Series | Type | Meaning |
+|--------|------|---------|
+| `swap_duration_seconds` | histogram | Wall-clock duration of a full engine swap |
+| `memory_settle_seconds` | histogram | Time spent waiting for `MemAvailable` to plateau after freeing an engine |
+| `in_flight_at_swap_start` | histogram | In-flight requests being drained when a swap began |
+| `swap_total{from,to,result}` | counter | Count of swaps by transition and result (`ok`/`error`) |
+| `engine_uptime_seconds{engine}` | gauge | Seconds the active engine has been active (since the last successful swap to it) |
 
 
 ## Client wiring
@@ -219,6 +442,20 @@ Common commands:
 # Swap to whichever engine owns a given model
 ./routerctl use qwen3.6-uncensored:27b
 ```
+
+
+## Development / tests
+
+The test suite is hermetic — no GPU and no network (engines are swapped out for
+a mock backend), so it runs anywhere CI does:
+
+```bash
+pip install '.[dev]'     # fastapi/uvicorn/httpx/pyyaml + pytest, pytest-asyncio
+python3 -m pytest -q
+```
+
+CI runs the same suite on every push and pull request (see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) and the badge at the top).
 
 
 ## Operations
