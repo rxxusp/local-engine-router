@@ -6,12 +6,40 @@ baked in here so the YAML file can stay small. The dataclasses below are the
 
   - RouterConfig.host / .port            where the router listens
   - RouterConfig.models                  list[ModelSpec], the static registry
-  - RouterConfig.ds4 / .ollama           per-engine settings
+  - RouterConfig.ds4 / .ollama           per-engine settings (legacy presets)
+  - RouterConfig.engines                 optional generic engine table (see below)
   - build_model_index(cfg)               {model_id -> ModelSpec}
 
 Routing is by the ``model`` field of each request. A model id is matched
 against this static registry first; unknown ids fall back to a live Ollama
 tag lookup at request time (see engines.EngineManager.engine_for).
+
+Engine configuration
+--------------------
+Historically the router hardcoded two engine keys, ``ds4`` and ``ollama``,
+configured via the top-level ``ds4:`` and ``ollama:`` sections. That still works
+unchanged. To add *new* engines without touching Python, use the optional
+top-level ``engines:`` table instead::
+
+    engines:
+      llamacpp:
+        type: generic_process
+        enabled: true
+        base_url: http://127.0.0.1:8080
+        start_cmd: ["/usr/local/bin/llama-server", "-m", "/models/foo.gguf"]
+        ready_path: /health
+        start_timeout_s: 300
+      tabby:
+        type: api_swap
+        enabled: true
+        base_url: http://127.0.0.1:5000
+        unload_path: /v1/model/unload
+        loaded_path: /v1/model
+
+When ``engines:`` is present it is the sole source of engines and the legacy
+``ds4:``/``ollama:`` sections are ignored. When it is absent the router falls
+back to building ``ds4`` (from ``ds4:``) + ``ollama`` (from ``ollama:``) exactly
+as before.
 """
 
 from __future__ import annotations
@@ -19,12 +47,26 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Any
 
 import yaml
 
 log = logging.getLogger("router.config")
+
+
+# Engine ``type`` discriminator values understood by the generic engine table.
+ENGINE_TYPES: frozenset[str] = frozenset(
+    {"ds4", "ollama", "generic_process", "api_swap"}
+)
+
+
+class ConfigError(ValueError):
+    """Raised for structural configuration problems with an actionable message.
+
+    Subclasses ``ValueError`` so existing callers that catch ``ValueError``
+    (the historical behaviour of ``load_config``) keep working.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -36,7 +78,7 @@ class ModelSpec:
     clients send in the request ``model`` field."""
 
     id: str
-    engine: str  # engine key: "ds4" | "ollama"
+    engine: str  # engine key: must match a configured engine
     display_name: str
     context_length: int = 131072
 
@@ -85,6 +127,103 @@ class OllamaConfig:
 
 
 @dataclass
+class GenericProcessConfig:
+    """A local server process the router launches and supervises.
+
+    Covers llama.cpp/llama-server, llamafile, vLLM, SGLang, Aphrodite — anything
+    that is a single long-running HTTP server we can spawn and signal.
+    """
+
+    enabled: bool = True
+    # Base URL the router uses to reach this engine.
+    base_url: str = ""
+    # Command to launch the server. Either a list (argv, run without a shell)
+    # or a string (run through the shell). Required.
+    start_cmd: list[str] | str = field(default_factory=list)
+    # Extra environment variables for the launched process (merged over os.environ).
+    env: dict[str, str] = field(default_factory=dict)
+    # Working directory for the launched process (optional).
+    cwd: str | None = None
+    # Readiness probe path appended to base_url (e.g. /health, /v1/models).
+    ready_path: str = "/health"
+    # Seconds to wait for a cold start to answer ready_path with HTTP 200.
+    # vLLM/SGLang can take minutes; default generously.
+    start_timeout_s: float = 300.0
+    # Signal used to ask the process group to stop (name or number; default SIGTERM).
+    stop_signal: str = "SIGTERM"
+    # Seconds to wait after stop_signal before escalating to SIGKILL, and the
+    # overall budget for the port to confirm closed.
+    stop_timeout_s: float = 30.0
+    # Optional pgrep -f pattern to find/kill stray processes we may not own
+    # (e.g. left behind by a previous run). Falls back to this if we have no
+    # tracked Popen handle.
+    process_pattern: str | None = None
+    # Where the launched process' stdout/stderr is appended (optional).
+    log_file: str | None = None
+
+
+@dataclass
+class ApiSwapConfig:
+    """An engine whose models load/unload over HTTP; the router owns no process.
+
+    Generalises Ollama and also covers TabbyAPI-style load/unload. ``free_vram``
+    is performed by calling the configured unload endpoint.
+    """
+
+    enabled: bool = True
+    base_url: str = ""
+    # Readiness probe path (does not load a model).
+    health_path: str = "/v1/models"
+    # Endpoint + method + body used to unload / free VRAM.
+    unload_path: str = ""
+    unload_method: str = "POST"
+    # JSON body sent to unload_path. {model} in any string value is substituted
+    # with each currently-loaded model name (when a list-loaded probe exists);
+    # otherwise the body is sent once as-is.
+    unload_body: dict[str, Any] = field(default_factory=dict)
+    # Optional probe that lists currently-loaded models, so we can unload each
+    # and confirm VRAM is released. path + the JSON key holding the list of
+    # entries + the per-entry key holding the model name.
+    loaded_path: str | None = None
+    loaded_models_key: str = "models"
+    loaded_name_key: str = "name"
+    # Seconds to wait for loaded models to clear after issuing unloads.
+    unload_timeout_s: float = 60.0
+    # Optional systemd unit to (best-effort) start if the API is unreachable.
+    systemd_unit: str | None = None
+    # TTL (seconds) for any cached list lookups (e.g. /v1/models for routing).
+    tags_cache_ttl_s: float = 30.0
+
+
+# Maps an engine ``type`` to the dataclass holding its parameters.
+_ENGINE_PARAM_CLASSES: dict[str, type] = {
+    "ds4": Ds4Config,
+    "ollama": OllamaConfig,
+    "generic_process": GenericProcessConfig,
+    "api_swap": ApiSwapConfig,
+}
+
+
+@dataclass
+class EngineSpec:
+    """One entry of the optional generic ``engines:`` table.
+
+    ``key`` is the engine key (the table's mapping key). ``type`` selects the
+    engine implementation. ``params`` is the type-specific config dataclass
+    (one of Ds4Config / OllamaConfig / GenericProcessConfig / ApiSwapConfig).
+    """
+
+    key: str
+    type: str
+    enabled: bool = True
+    params: Any = None
+
+    @property
+    def base_url(self) -> str:
+        return getattr(self.params, "base_url", "") or ""
+
+
+@dataclass
 class RouterConfig:
     # Safe default: localhost only. Set to 0.0.0.0 explicitly to expose the
     # router off-localhost (e.g. to reach it from a Docker container via the
@@ -117,10 +256,17 @@ class RouterConfig:
     upstream_connect_timeout_s: float = 15.0
     ds4: Ds4Config = field(default_factory=Ds4Config)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    # Optional generic engine table. Empty == legacy ds4/ollama mode (built from
+    # the ds4:/ollama: sections above). Non-empty == engines built from here by
+    # type, and ds4:/ollama: are ignored.
+    engines: list[EngineSpec] = field(default_factory=list)
     models: list[ModelSpec] = field(default_factory=list)
 
     # Convenience -------------------------------------------------------- #
     def engine_keys(self) -> list[str]:
+        """Engine keys that are configured AND enabled, in declaration order."""
+        if self.engines:
+            return [e.key for e in self.engines if e.enabled]
         keys = []
         if self.ds4.enabled:
             keys.append("ds4")
@@ -132,19 +278,126 @@ class RouterConfig:
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-def _coerce_section(cls, data: dict[str, Any] | None):
+def _coerce_section(cls, data: dict[str, Any] | None, *, ctx: str | None = None):
     """Build a dataclass from a dict, ignoring unknown keys (forward-compat)."""
     if not data:
         return cls()
     known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
     unknown = set(data) - known
     if unknown:
-        log.warning("ignoring unknown %s keys: %s", cls.__name__, sorted(unknown))
+        where = ctx or cls.__name__
+        log.warning("ignoring unknown %s keys: %s", where, sorted(unknown))
     return cls(**{k: v for k, v in data.items() if k in known})
 
 
+def _required_fields_present(params: Any, required: tuple[str, ...]) -> list[str]:
+    """Return the subset of *required* attribute names that are empty/unset."""
+    missing = []
+    for name in required:
+        val = getattr(params, name, None)
+        if val in (None, "", [], {}):
+            missing.append(name)
+    return missing
+
+
+def _build_engines_section(raw_engines: Any) -> list[EngineSpec]:
+    """Parse the optional top-level ``engines:`` mapping into EngineSpecs.
+
+    Validates the engine ``type`` discriminator, duplicate keys, and the
+    required fields for each engine type. Raises ConfigError on structural
+    problems; logs soft warnings for non-fatal issues (e.g. paths missing).
+    """
+    if not raw_engines:
+        return []
+    if not isinstance(raw_engines, dict):
+        raise ConfigError(
+            "'engines' must be a mapping of engine_key -> engine settings"
+        )
+
+    specs: list[EngineSpec] = []
+    seen: set[str] = set()
+    for key, body in raw_engines.items():
+        if key in seen:
+            raise ConfigError(f"duplicate engine key {key!r} in 'engines'")
+        seen.add(key)
+        if not isinstance(body, dict):
+            raise ConfigError(
+                f"engine {key!r}: settings must be a mapping, got {type(body).__name__}"
+            )
+        etype = body.get("type")
+        if not etype:
+            raise ConfigError(
+                f"engine {key!r}: missing required 'type' "
+                f"(one of {sorted(ENGINE_TYPES)})"
+            )
+        if etype not in ENGINE_TYPES:
+            raise ConfigError(
+                f"engine {key!r}: unknown type {etype!r} "
+                f"(must be one of {sorted(ENGINE_TYPES)})"
+            )
+
+        enabled = bool(body.get("enabled", True))
+        param_cls = _ENGINE_PARAM_CLASSES[etype]
+        # Everything except the discriminator/enabled flag is engine params.
+        param_data = {k: v for k, v in body.items() if k not in ("type", "enabled")}
+        params = _coerce_section(
+            param_cls, param_data, ctx=f"engine {key!r} ({etype})"
+        )
+        # Keep params.enabled in sync with the spec-level flag for consistency.
+        if hasattr(params, "enabled"):
+            params.enabled = enabled
+
+        _validate_engine_params(key, etype, params)
+        specs.append(EngineSpec(key=key, type=etype, enabled=enabled, params=params))
+
+    return specs
+
+
+def _validate_engine_params(key: str, etype: str, params: Any) -> None:
+    """Validate required fields for a single engine; warn on soft issues."""
+    if etype == "generic_process":
+        missing = _required_fields_present(params, ("base_url", "start_cmd"))
+        if missing:
+            raise ConfigError(
+                f"engine {key!r} (generic_process): missing required field(s): "
+                f"{', '.join(missing)}"
+            )
+    elif etype == "api_swap":
+        missing = _required_fields_present(params, ("base_url",))
+        if missing:
+            raise ConfigError(
+                f"engine {key!r} (api_swap): missing required field(s): "
+                f"{', '.join(missing)}"
+            )
+        if not getattr(params, "unload_path", ""):
+            log.warning(
+                "engine %r (api_swap): no 'unload_path' set; free_vram() will be "
+                "a no-op (fine if this engine never needs to release the GPU)",
+                key,
+            )
+    elif etype == "ds4":
+        # ds4 has defaults for everything; only sanity-check serve_script when in
+        # process-control mode.
+        if getattr(params, "control", "") == "process":
+            script = getattr(params, "serve_script", "")
+            if script and not os.path.exists(script):
+                log.warning(
+                    "engine %r (ds4): serve_script %s does not exist", key, script
+                )
+    elif etype == "ollama":
+        if not getattr(params, "base_url", ""):
+            raise ConfigError(f"engine {key!r} (ollama): missing required 'base_url'")
+
+
 def load_config(path: str) -> RouterConfig:
-    """Load YAML config from *path*, applying defaults for anything omitted."""
+    """Load YAML config from *path*, applying defaults for anything omitted.
+
+    Validates structural problems and raises ConfigError (a ValueError) with an
+    actionable message: a model.engine that references no configured engine, an
+    unknown engine type, a missing required field for an engine type, or a
+    duplicate engine key. Non-fatal issues (e.g. a serve_script that does not
+    exist) are logged as warnings.
+    """
     raw: dict[str, Any] = {}
     if path and os.path.exists(path):
         with open(path) as fh:
@@ -152,11 +405,21 @@ def load_config(path: str) -> RouterConfig:
     else:
         log.warning("config file %s not found; using built-in defaults", path)
 
+    if not isinstance(raw, dict):
+        raise ConfigError("top-level config must be a mapping")
+
     ds4 = _coerce_section(Ds4Config, raw.get("ds4"))
     ollama = _coerce_section(OllamaConfig, raw.get("ollama"))
+    engines = _build_engines_section(raw.get("engines"))
 
     models: list[ModelSpec] = []
     for m in raw.get("models", []) or []:
+        if "id" not in m:
+            raise ConfigError("every model entry must have an 'id'")
+        if "engine" not in m:
+            raise ConfigError(
+                f"model {m['id']!r} must specify an 'engine'"
+            )
         models.append(
             ModelSpec(
                 id=m["id"],
@@ -166,20 +429,26 @@ def load_config(path: str) -> RouterConfig:
             )
         )
 
+    skip = {"ds4", "ollama", "engines", "models"}
     top = {
         k: v
         for k, v in raw.items()
-        if k in RouterConfig.__dataclass_fields__ and k not in ("ds4", "ollama", "models")
+        if k in RouterConfig.__dataclass_fields__ and k not in skip
     }
-    cfg = RouterConfig(ds4=ds4, ollama=ollama, models=models, **top)
+    cfg = RouterConfig(
+        ds4=ds4, ollama=ollama, engines=engines, models=models, **top
+    )
 
-    # Validate engine references.
-    valid_engines = {"ds4", "ollama"}
+    # Validate model -> engine references against whatever engines are configured.
+    if cfg.engines:
+        valid_engines = {e.key for e in cfg.engines}
+    else:
+        valid_engines = {"ds4", "ollama"}
     for spec in cfg.models:
         if spec.engine not in valid_engines:
-            raise ValueError(
+            raise ConfigError(
                 f"model {spec.id!r} references unknown engine {spec.engine!r} "
-                f"(must be one of {sorted(valid_engines)})"
+                f"(configured engines: {sorted(valid_engines)})"
             )
     return cfg
 
@@ -192,6 +461,174 @@ def build_model_index(cfg: RouterConfig) -> dict[str, ModelSpec]:
             log.warning("duplicate model id %r in config; later wins", spec.id)
         index[spec.id] = spec
     return index
+
+
+# --------------------------------------------------------------------------- #
+# JSON Schema (draft 2020-12), derived from the dataclasses
+# --------------------------------------------------------------------------- #
+def _json_type_for(anno: Any) -> dict[str, Any]:
+    """Map a dataclass field annotation to a JSON Schema type fragment.
+
+    Best-effort: handles the concrete annotations used by our dataclasses
+    (str, int, float, bool, list[...], dict[...], optionals, unions).
+    """
+    # Annotations are stored as strings (``from __future__ import annotations``).
+    text = anno if isinstance(anno, str) else getattr(anno, "__name__", str(anno))
+    text = text.replace(" ", "")
+
+    # Split top-level unions first (bracket-depth-aware) so "list[str]|str" is
+    # treated as a union of two arms, not as a list with a malformed inner type.
+    arms = _split_union(text)
+    optional = "None" in arms
+    arms = [a for a in arms if a != "None"]
+
+    if not arms:  # was bare ``None``
+        return {"type": "null"}
+    if len(arms) > 1:
+        frag: dict[str, Any] = {"anyOf": [_atom_type(a) for a in arms]}
+    else:
+        frag = _atom_type(arms[0])
+
+    if optional and frag:
+        # Permit null in addition to the declared shape.
+        if "anyOf" in frag:
+            frag["anyOf"].append({"type": "null"})
+        else:
+            frag = {"anyOf": [frag, {"type": "null"}]}
+    return frag
+
+
+def _split_union(text: str) -> list[str]:
+    """Split a type string on top-level ``|`` (ignoring ``|`` inside brackets)."""
+    arms: list[str] = []
+    depth = 0
+    cur = ""
+    for ch in text:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        if ch == "|" and depth == 0:
+            arms.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur:
+        arms.append(cur)
+    return arms
+
+
+def _atom_type(text: str) -> dict[str, Any]:
+    """Map a single (non-union) type atom to a JSON Schema fragment."""
+    scalars = {
+        "str": {"type": "string"},
+        "int": {"type": "integer"},
+        "float": {"type": "number"},
+        "bool": {"type": "boolean"},
+        "Any": {},
+    }
+    if text in scalars:
+        return dict(scalars[text])
+    if text.startswith("list["):
+        inner = text[len("list[") : -1]
+        return {"type": "array", "items": _json_type_for(inner)}
+    if text.startswith("dict["):
+        return {"type": "object", "additionalProperties": True}
+    # Unknown / parameterised generic: accept anything.
+    return {}
+
+
+def _schema_for_dataclass(cls: type, *, exclude: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Build a JSON Schema object node from a dataclass' fields + defaults."""
+    props: dict[str, Any] = {}
+    for f in fields(cls):
+        if f.name in exclude:
+            continue
+        frag = _json_type_for(f.type)
+        # Attach the default value as a documentation hint where it's a simple
+        # scalar (skip factory defaults / dataclass instances).
+        if f.default is not MISSING and isinstance(
+            f.default, (str, int, float, bool)
+        ):
+            frag = {**frag, "default": f.default}
+        props[f.name] = frag
+    return {
+        "type": "object",
+        "properties": props,
+        "additionalProperties": True,  # forward-compat: unknown keys warned, not rejected
+    }
+
+
+def config_json_schema() -> dict[str, Any]:
+    """Return a JSON Schema (draft 2020-12) describing the full config.
+
+    Derived from the dataclasses, including the generic engine types in the
+    optional ``engines:`` table. ``additionalProperties`` is left open because
+    the loader treats unknown keys as a soft warning (forward-compat).
+    """
+    ds4_schema = _schema_for_dataclass(Ds4Config)
+    ollama_schema = _schema_for_dataclass(OllamaConfig)
+    generic_schema = _schema_for_dataclass(GenericProcessConfig)
+    apiswap_schema = _schema_for_dataclass(ApiSwapConfig)
+
+    def _with_type(node: dict[str, Any], type_const: str) -> dict[str, Any]:
+        node = {
+            **node,
+            "properties": {
+                "type": {"const": type_const},
+                **node["properties"],
+            },
+            "required": ["type"],
+        }
+        return node
+
+    engine_entry = {
+        "oneOf": [
+            _with_type(ds4_schema, "ds4"),
+            _with_type(ollama_schema, "ollama"),
+            _with_type(generic_schema, "generic_process"),
+            _with_type(apiswap_schema, "api_swap"),
+        ],
+    }
+
+    model_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "engine": {"type": "string"},
+            "display_name": {"type": "string"},
+            "context_length": {"type": "integer", "default": 131072},
+        },
+        "required": ["id", "engine"],
+        "additionalProperties": True,
+    }
+
+    root = _schema_for_dataclass(
+        RouterConfig, exclude=("ds4", "ollama", "engines", "models")
+    )
+    root["properties"]["ds4"] = ds4_schema
+    root["properties"]["ollama"] = ollama_schema
+    root["properties"]["engines"] = {
+        "type": "object",
+        "description": (
+            "Optional generic engine table: engine_key -> engine settings. "
+            "When present it is the sole source of engines and the ds4:/ollama: "
+            "sections are ignored."
+        ),
+        "additionalProperties": engine_entry,
+    }
+    root["properties"]["models"] = {"type": "array", "items": model_schema}
+
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://github.com/rxxusp/local-engine-router/config.schema.json",
+        "title": "llm-router configuration",
+        "description": (
+            "Configuration schema for llm-router (local-engine-router). Unknown "
+            "keys are accepted with a warning for forward compatibility."
+        ),
+        **root,
+    }
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,409 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/rxxusp/local-engine-router/config.schema.json",
+  "title": "llm-router configuration",
+  "description": "Configuration schema for llm-router (local-engine-router). Unknown keys are accepted with a warning for forward compatibility.",
+  "type": "object",
+  "properties": {
+    "host": {
+      "type": "string",
+      "default": "127.0.0.1"
+    },
+    "port": {
+      "type": "integer",
+      "default": 8077
+    },
+    "api_keys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "log_file": {
+      "type": "string",
+      "default": "/home/grahamfm/llm-router/logs/router.log"
+    },
+    "log_level": {
+      "type": "string",
+      "default": "INFO"
+    },
+    "state_file": {
+      "type": "string",
+      "default": "/home/grahamfm/llm-router/state.json"
+    },
+    "swap_keepalive_interval_s": {
+      "type": "number",
+      "default": 5.0
+    },
+    "swap_keepalive_enabled": {
+      "type": "boolean",
+      "default": true
+    },
+    "drain_timeout_s": {
+      "type": "number",
+      "default": 30.0
+    },
+    "swap_memory_settle_timeout_s": {
+      "type": "number",
+      "default": 25.0
+    },
+    "upstream_connect_timeout_s": {
+      "type": "number",
+      "default": 15.0
+    },
+    "ds4": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "base_url": {
+          "type": "string",
+          "default": "http://172.17.0.1:8099"
+        },
+        "control": {
+          "type": "string",
+          "default": "systemd-user"
+        },
+        "systemd_user_unit": {
+          "type": "string",
+          "default": "ds4.service"
+        },
+        "serve_script": {
+          "type": "string",
+          "default": "/home/grahamfm/ds4/serve.sh"
+        },
+        "process_pattern": {
+          "type": "string",
+          "default": "ds4/ds4-server"
+        },
+        "health_path": {
+          "type": "string",
+          "default": "/v1/models"
+        },
+        "start_timeout_s": {
+          "type": "number",
+          "default": 240.0
+        },
+        "stop_timeout_s": {
+          "type": "number",
+          "default": 45.0
+        },
+        "log_file": {
+          "type": "string",
+          "default": "/home/grahamfm/llm-router/logs/ds4-server.log"
+        }
+      },
+      "additionalProperties": true
+    },
+    "ollama": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "base_url": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434"
+        },
+        "health_path": {
+          "type": "string",
+          "default": "/api/tags"
+        },
+        "unload_timeout_s": {
+          "type": "number",
+          "default": 60.0
+        },
+        "systemd_unit": {
+          "type": "string",
+          "default": "ollama.service"
+        },
+        "tags_cache_ttl_s": {
+          "type": "number",
+          "default": 30.0
+        }
+      },
+      "additionalProperties": true
+    },
+    "engines": {
+      "type": "object",
+      "description": "Optional generic engine table: engine_key -> engine settings. When present it is the sole source of engines and the ds4:/ollama: sections are ignored.",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "ds4"
+              },
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "base_url": {
+                "type": "string",
+                "default": "http://172.17.0.1:8099"
+              },
+              "control": {
+                "type": "string",
+                "default": "systemd-user"
+              },
+              "systemd_user_unit": {
+                "type": "string",
+                "default": "ds4.service"
+              },
+              "serve_script": {
+                "type": "string",
+                "default": "/home/grahamfm/ds4/serve.sh"
+              },
+              "process_pattern": {
+                "type": "string",
+                "default": "ds4/ds4-server"
+              },
+              "health_path": {
+                "type": "string",
+                "default": "/v1/models"
+              },
+              "start_timeout_s": {
+                "type": "number",
+                "default": 240.0
+              },
+              "stop_timeout_s": {
+                "type": "number",
+                "default": 45.0
+              },
+              "log_file": {
+                "type": "string",
+                "default": "/home/grahamfm/llm-router/logs/ds4-server.log"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "type"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "ollama"
+              },
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "base_url": {
+                "type": "string",
+                "default": "http://127.0.0.1:11434"
+              },
+              "health_path": {
+                "type": "string",
+                "default": "/api/tags"
+              },
+              "unload_timeout_s": {
+                "type": "number",
+                "default": 60.0
+              },
+              "systemd_unit": {
+                "type": "string",
+                "default": "ollama.service"
+              },
+              "tags_cache_ttl_s": {
+                "type": "number",
+                "default": 30.0
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "type"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "generic_process"
+              },
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "base_url": {
+                "type": "string",
+                "default": ""
+              },
+              "start_cmd": {
+                "anyOf": [
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  {
+                    "type": "string"
+                  }
+                ]
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "cwd": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "ready_path": {
+                "type": "string",
+                "default": "/health"
+              },
+              "start_timeout_s": {
+                "type": "number",
+                "default": 300.0
+              },
+              "stop_signal": {
+                "type": "string",
+                "default": "SIGTERM"
+              },
+              "stop_timeout_s": {
+                "type": "number",
+                "default": 30.0
+              },
+              "process_pattern": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "log_file": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "type"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "api_swap"
+              },
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "base_url": {
+                "type": "string",
+                "default": ""
+              },
+              "health_path": {
+                "type": "string",
+                "default": "/v1/models"
+              },
+              "unload_path": {
+                "type": "string",
+                "default": ""
+              },
+              "unload_method": {
+                "type": "string",
+                "default": "POST"
+              },
+              "unload_body": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "loaded_path": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "loaded_models_key": {
+                "type": "string",
+                "default": "models"
+              },
+              "loaded_name_key": {
+                "type": "string",
+                "default": "name"
+              },
+              "unload_timeout_s": {
+                "type": "number",
+                "default": 60.0
+              },
+              "systemd_unit": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "tags_cache_ttl_s": {
+                "type": "number",
+                "default": 30.0
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "type"
+            ]
+          }
+        ]
+      }
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "engine": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "context_length": {
+            "type": "integer",
+            "default": 131072
+          }
+        },
+        "required": [
+          "id",
+          "engine"
+        ],
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

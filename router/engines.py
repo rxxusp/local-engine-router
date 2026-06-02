@@ -1,11 +1,25 @@
 """Engines and the swap state machine.
 
 Only one *heavy* engine can hold the GB10's unified memory at a time, so the
-router enforces strict mutual exclusion between ds4 and Ollama:
+router enforces strict mutual exclusion between engines: to bring one up it
+first drains and frees whatever else currently holds the GPU.
 
-  * To run ds4   -> unload every loaded Ollama model, then (re)start ds4-server.
-  * To run Ollama-> SIGTERM the ds4-server process (freeing its ~81 GB), then
-                    let Ollama load the requested model on demand.
+Engine kinds
+------------
+* ``Engine``                base class; controls one backend's lifecycle.
+* ``GenericProcessEngine``  launches + supervises a local server process
+                            (llama.cpp/llama-server, llamafile, vLLM, SGLang,
+                            Aphrodite). SIGTERM -> SIGKILL with port-close
+                            verification (carried over from Ds4Engine because
+                            llama.cpp has a confirmed SIGTERM-freeze bug).
+* ``APISwapEngine``         an engine whose models load/unload over HTTP; the
+                            router owns no process. ``free_vram`` calls a
+                            configurable unload endpoint (covers TabbyAPI).
+* ``OllamaEngine``          a thin preset of ``APISwapEngine`` keeping every
+                            Ollama specific (/api/ps, /api/tags TTL cache,
+                            keep_alive:0 + 'ollama stop' CLI fallback).
+* ``Ds4Engine``             the bespoke escape hatch (systemctl --user / odd
+                            lifecycle); kept exactly as before.
 
 EngineManager.acquire(model_id) is the single entry point used by the HTTP
 layer. It guarantees that, by the time it returns, the engine that owns
@@ -29,6 +43,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -36,6 +51,7 @@ from typing import Any
 
 import httpx
 
+from . import metrics
 from .config import RouterConfig, build_model_index
 
 log = logging.getLogger("router.engines")
@@ -43,6 +59,21 @@ log = logging.getLogger("router.engines")
 
 class EngineError(RuntimeError):
     """Raised when an engine cannot be made ready (start/swap failure)."""
+
+
+def _resolve_signal(name: str | int) -> int:
+    """Resolve a signal name ("SIGTERM") or number to its int value."""
+    if isinstance(name, int):
+        return name
+    try:
+        return int(name)
+    except (TypeError, ValueError):
+        pass
+    sig = getattr(signal, str(name).upper(), None)
+    if sig is None:
+        log.warning("unknown stop_signal %r; falling back to SIGTERM", name)
+        return signal.SIGTERM
+    return int(sig)
 
 
 # --------------------------------------------------------------------------- #
@@ -95,8 +126,9 @@ class Ds4Engine(Engine):
 
     key = "ds4"
 
-    def __init__(self, cfg) -> None:
+    def __init__(self, cfg, *, key: str = "ds4") -> None:
         super().__init__()
+        self.key = key
         self.cfg = cfg
         self.base_url = cfg.base_url.rstrip("/")
         self._proc: subprocess.Popen | None = None
@@ -283,17 +315,210 @@ class Ds4Engine(Engine):
             return False
 
 
-class OllamaEngine(Engine):
-    """Ollama runs as a persistent systemd service. "Starting" it means making
-    sure the service answers; freeing VRAM means unloading every loaded model
-    (Ollama keeps them resident because OLLAMA_KEEP_ALIVE=-1)."""
+class GenericProcessEngine(Engine):
+    """A local server process the router launches and supervises.
 
-    key = "ollama"
+    Configured entirely from YAML (see config.GenericProcessConfig): a
+    ``start_cmd`` launched under its own session, polled at ``ready_path`` until
+    HTTP 200 or ``start_timeout_s``. ``free_vram`` signals the process group
+    with ``stop_signal``, escalates to SIGKILL after ``stop_timeout_s``, and
+    VERIFIES the listening port is actually closed before returning — llama.cpp
+    has a confirmed SIGTERM-freeze bug, so a plain SIGTERM is not trusted.
 
-    def __init__(self, cfg) -> None:
+    Covers llama.cpp/llama-server, llamafile, vLLM, SGLang, Aphrodite.
+    """
+
+    def __init__(self, cfg, *, key: str) -> None:
         super().__init__()
+        self.key = key
         self.cfg = cfg
-        self.base_url = cfg.base_url.rstrip("/")
+        self.base_url = (cfg.base_url or "").rstrip("/")
+        self._proc: subprocess.Popen | None = None
+
+    # -- readiness ------------------------------------------------------- #
+    async def is_ready(self) -> bool:
+        try:
+            r = await self._ctl.get(self.base_url + self.cfg.ready_path)
+            return r.status_code == 200
+        except (httpx.HTTPError, OSError):
+            return False
+
+    # -- process discovery ----------------------------------------------- #
+    def _argv(self) -> list[str] | str:
+        cmd = self.cfg.start_cmd
+        return cmd
+
+    def _pids(self) -> list[int]:
+        """Find this engine's pids via the tracked Popen and/or process_pattern."""
+        pids: list[int] = []
+        if self._proc is not None and self._proc.poll() is None:
+            pids.append(self._proc.pid)
+        pattern = self.cfg.process_pattern
+        if pattern:
+            try:
+                out = subprocess.run(
+                    ["pgrep", "-f", pattern],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError):
+                out = None
+            if out is not None:
+                for line in out.stdout.split():
+                    try:
+                        pid = int(line)
+                    except ValueError:
+                        continue
+                    if pid != os.getpid() and pid not in pids:
+                        pids.append(pid)
+        return pids
+
+    def is_running(self) -> bool:
+        return bool(self._pids())
+
+    # -- start ----------------------------------------------------------- #
+    async def ensure_started(self) -> None:
+        if await self.is_ready():
+            return
+        if self.is_running():
+            log.info("%s: process already running, waiting for readiness", self.key)
+        else:
+            self._launch()
+        ok = await self.wait_ready(self.cfg.start_timeout_s)
+        if not ok:
+            raise EngineError(
+                f"{self.key} did not become ready within {self.cfg.start_timeout_s}s"
+            )
+
+    def _launch(self) -> None:
+        cmd = self._argv()
+        if not cmd:
+            raise EngineError(f"{self.key}: no start_cmd configured")
+        # Accept a shell string or an argv list. A string is split with shlex
+        # (POSIX) so we still run without a shell and keep start_new_session
+        # semantics (so free_vram can signal the whole process group).
+        if isinstance(cmd, str):
+            argv = shlex.split(cmd)
+        else:
+            argv = list(cmd)
+        if not argv:
+            raise EngineError(f"{self.key}: start_cmd is empty")
+
+        env = None
+        if self.cfg.env:
+            env = os.environ.copy()
+            env.update({str(k): str(v) for k, v in self.cfg.env.items()})
+
+        logfh: Any = subprocess.DEVNULL
+        if self.cfg.log_file:
+            try:
+                os.makedirs(os.path.dirname(self.cfg.log_file), exist_ok=True)
+                logfh = open(self.cfg.log_file, "ab", buffering=0)
+            except OSError as exc:
+                log.warning("%s: could not open log_file %s: %s",
+                            self.key, self.cfg.log_file, exc)
+                logfh = subprocess.DEVNULL
+
+        log.info("%s: launching %s", self.key, argv)
+        self._proc = subprocess.Popen(
+            argv,
+            stdout=logfh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            env=env,
+            cwd=self.cfg.cwd or None,
+        )
+
+    # -- stop / free VRAM ------------------------------------------------ #
+    async def free_vram(self) -> None:
+        sig = _resolve_signal(self.cfg.stop_signal)
+        pids = self._pids()
+        if not pids and not await self._port_open():
+            log.info("%s: no process to stop", self.key)
+            self._proc = None
+            return
+
+        try:
+            sig_name = signal.Signals(sig).name
+        except ValueError:
+            sig_name = str(sig)
+        log.info("%s: sending %s to process group(s) of %s", self.key, sig_name, pids)
+        self._signal_pids(pids, sig)
+
+        # SIGTERM->SIGKILL escalation + port-close verification (llama.cpp can
+        # freeze on SIGTERM, so we never trust the signal alone).
+        if not await self._wait_stopped(self.cfg.stop_timeout_s):
+            await self._sigkill_leftover()
+
+        self._proc = None
+        if self._pids() or await self._port_open():
+            raise EngineError(
+                f"{self.key} would not stop (port still open / process alive)"
+            )
+        log.info("%s: stopped, VRAM released", self.key)
+
+    def _signal_pids(self, pids: list[int], sig: int) -> None:
+        for pid in pids:
+            # Signal the whole process group (we launched with
+            # start_new_session=True, so the leader's pgid == its pid).
+            try:
+                os.killpg(os.getpgid(pid), sig)
+                continue
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                log.error("%s: not permitted to signal pid %s", self.key, pid)
+
+    async def _sigkill_leftover(self) -> None:
+        leftover = self._pids()
+        if not leftover:
+            return
+        log.warning("%s: %s still alive after %s; SIGKILL",
+                    self.key, leftover, self.cfg.stop_signal)
+        self._signal_pids(leftover, signal.SIGKILL)
+        await self._wait_stopped(10.0)
+
+    async def _wait_stopped(self, timeout_s: float) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while loop.time() < deadline:
+            if not self._pids() and not await self._port_open():
+                return True
+            await asyncio.sleep(0.5)
+        return not self._pids() and not await self._port_open()
+
+    async def _port_open(self) -> bool:
+        try:
+            r = await self._ctl.get(
+                self.base_url + self.cfg.ready_path,
+                timeout=httpx.Timeout(2.0, connect=1.0),
+            )
+            return r.status_code < 600  # any HTTP answer => port still open
+        except (httpx.HTTPError, OSError):
+            return False
+
+
+class APISwapEngine(Engine):
+    """An engine whose models are loaded/unloaded over HTTP (no owned process).
+
+    Generic, config-driven (see config.ApiSwapConfig): readiness is a GET on
+    ``health_path``; ``free_vram`` issues the configured unload request and (if
+    a ``loaded_path`` probe is configured) waits until no models remain. Covers
+    TabbyAPI-style load/unload. ``OllamaEngine`` subclasses this to keep its
+    Ollama-specific behaviour.
+    """
+
+    def __init__(self, cfg, *, key: str) -> None:
+        super().__init__()
+        self.key = key
+        self.cfg = cfg
+        self.base_url = (cfg.base_url or "").rstrip("/")
         self._tags_cache: tuple[float, set[str]] | None = None
 
     # -- readiness ------------------------------------------------------- #
@@ -307,17 +532,133 @@ class OllamaEngine(Engine):
     async def ensure_started(self) -> None:
         if await self.is_ready():
             return
-        # Best effort: try to start the systemd unit (router runs as a user that
-        # may be allowed to start it; ignore failures and just probe).
-        log.info("ollama: service not answering, attempting to start %s", self.cfg.systemd_unit)
-        for cmd in (["systemctl", "start", self.cfg.systemd_unit],
-                    ["sudo", "-n", "systemctl", "start", self.cfg.systemd_unit]):
-            try:
-                subprocess.run(cmd, capture_output=True, timeout=10)
-            except (OSError, subprocess.SubprocessError):
-                continue
+        unit = getattr(self.cfg, "systemd_unit", None)
+        if unit:
+            log.info("%s: not answering, attempting to start %s", self.key, unit)
+            for cmd in (["systemctl", "start", unit],
+                        ["sudo", "-n", "systemctl", "start", unit]):
+                try:
+                    subprocess.run(cmd, capture_output=True, timeout=10)
+                except (OSError, subprocess.SubprocessError):
+                    continue
         if not await self.wait_ready(20.0):
-            raise EngineError("ollama service is not reachable")
+            raise EngineError(f"{self.key} service is not reachable")
+
+    # -- loaded models / unload ----------------------------------------- #
+    async def loaded_models(self) -> list[str]:
+        """List currently-loaded models via the configured loaded_path probe."""
+        path = getattr(self.cfg, "loaded_path", None)
+        if not path:
+            return []
+        try:
+            r = await self._ctl.get(self.base_url + path)
+            data = r.json()
+        except (httpx.HTTPError, OSError, ValueError):
+            return []
+        return self._extract_loaded_names(data)
+
+    def _extract_loaded_names(self, data: Any) -> list[str]:
+        names: list[str] = []
+        key = getattr(self.cfg, "loaded_models_key", "models")
+        name_key = getattr(self.cfg, "loaded_name_key", "name")
+        entries = data.get(key, []) if isinstance(data, dict) else data
+        for m in entries or []:
+            if isinstance(m, str):
+                names.append(m)
+            elif isinstance(m, dict):
+                name = m.get(name_key) or m.get("model") or m.get("id")
+                if name:
+                    names.append(name)
+        return names
+
+    async def free_vram(self) -> None:
+        loaded = await self.loaded_models()
+        if getattr(self.cfg, "loaded_path", None) and not loaded:
+            log.info("%s: no models loaded", self.key)
+            return
+
+        if loaded:
+            log.info("%s: unloading models %s", self.key, loaded)
+            for name in loaded:
+                await self._unload(name)
+        else:
+            # No list probe: issue the unload request once (best effort).
+            await self._unload(None)
+
+        # If we can list loaded models, wait until empty (VRAM released).
+        if getattr(self.cfg, "loaded_path", None):
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.cfg.unload_timeout_s
+            while loop.time() < deadline:
+                if not await self.loaded_models():
+                    log.info("%s: all models unloaded, VRAM released", self.key)
+                    return
+                await asyncio.sleep(0.5)
+            still = await self.loaded_models()
+            if still:
+                log.warning("%s: models still loaded after timeout: %s", self.key, still)
+
+    async def _unload(self, name: str | None) -> None:
+        """Issue the configured unload request (optionally for one model)."""
+        url_path = getattr(self.cfg, "unload_path", "")
+        if not url_path:
+            log.debug("%s: no unload_path configured; free_vram is a no-op", self.key)
+            return
+        method = (getattr(self.cfg, "unload_method", "POST") or "POST").upper()
+        body = self._render_unload_body(name)
+        try:
+            await self._ctl.request(
+                method,
+                self.base_url + url_path,
+                json=body if body else None,
+                timeout=httpx.Timeout(30.0, connect=5.0),
+            )
+        except (httpx.HTTPError, OSError) as exc:
+            log.warning("%s: unload request for %s failed: %s", self.key, name, exc)
+
+    def _render_unload_body(self, name: str | None) -> dict[str, Any]:
+        """Substitute {model} in the configured unload_body with *name*."""
+        tmpl = getattr(self.cfg, "unload_body", None) or {}
+        if not name:
+            return dict(tmpl)
+        out: dict[str, Any] = {}
+        for k, v in tmpl.items():
+            if isinstance(v, str):
+                out[k] = v.replace("{model}", name)
+            else:
+                out[k] = v
+        return out
+
+    # -- available tags (for routing fallback + /v1/models) -------------- #
+    async def available_tags(self) -> set[str]:
+        """Cached list of model ids this engine can serve (for routing).
+
+        Generic base uses loaded_path; OllamaEngine overrides with /api/tags.
+        """
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        ttl = getattr(self.cfg, "tags_cache_ttl_s", 30.0)
+        if self._tags_cache and now - self._tags_cache[0] < ttl:
+            return self._tags_cache[1]
+        tags = set(await self.loaded_models())
+        self._tags_cache = (now, tags)
+        return tags
+
+
+class OllamaEngine(APISwapEngine):
+    """Ollama runs as a persistent systemd service. "Starting" it means making
+    sure the service answers; freeing VRAM means unloading every loaded model
+    (Ollama keeps them resident because OLLAMA_KEEP_ALIVE=-1).
+
+    A thin preset of APISwapEngine that keeps every Ollama specific:
+    loaded_models() via /api/ps, available_tags() via /api/tags with a TTL
+    cache, and _unload() via keep_alive:0 with an 'ollama stop' CLI fallback.
+    """
+
+    key = "ollama"
+
+    def __init__(self, cfg, *, key: str = "ollama") -> None:
+        super().__init__(cfg, key=key)
 
     # -- loaded models / unload ----------------------------------------- #
     async def loaded_models(self) -> list[str]:
@@ -354,8 +695,10 @@ class OllamaEngine(Engine):
         if still:
             log.warning("ollama: models still loaded after timeout: %s", still)
 
-    async def _unload(self, name: str) -> None:
+    async def _unload(self, name: str | None) -> None:
         # keep_alive:0 with no prompt unloads immediately without generating.
+        if not name:
+            return
         try:
             await self._ctl.post(
                 self.base_url + "/api/generate",
@@ -395,17 +738,52 @@ class OllamaEngine(Engine):
 
 
 # --------------------------------------------------------------------------- #
+# Engine construction (generic, config-driven)
+# --------------------------------------------------------------------------- #
+def _build_engine(key: str, etype: str, params) -> Engine:
+    """Instantiate one engine from its type + params dataclass."""
+    if etype == "ds4":
+        return Ds4Engine(params, key=key)
+    if etype == "ollama":
+        return OllamaEngine(params, key=key)
+    if etype == "generic_process":
+        return GenericProcessEngine(params, key=key)
+    if etype == "api_swap":
+        return APISwapEngine(params, key=key)
+    raise EngineError(f"unknown engine type {etype!r} for engine {key!r}")
+
+
+def build_engines(cfg: RouterConfig) -> dict[str, Engine]:
+    """Build the engine table from config.
+
+    If cfg.engines (the generic table) is present, build from it by type.
+    Otherwise fall back to ds4 (from cfg.ds4) + ollama (from cfg.ollama),
+    exactly as the router did before the generic table existed.
+    """
+    engines: dict[str, Engine] = {}
+    if cfg.engines:
+        for spec in cfg.engines:
+            if not spec.enabled:
+                continue
+            engines[spec.key] = _build_engine(spec.key, spec.type, spec.params)
+        return engines
+
+    # Legacy path: identical behaviour to the original hardcoded construction.
+    if cfg.ds4.enabled:
+        engines["ds4"] = Ds4Engine(cfg.ds4)
+    if cfg.ollama.enabled:
+        engines["ollama"] = OllamaEngine(cfg.ollama)
+    return engines
+
+
+# --------------------------------------------------------------------------- #
 # Engine manager: the swap state machine
 # --------------------------------------------------------------------------- #
 class EngineManager:
     def __init__(self, cfg: RouterConfig) -> None:
         self.cfg = cfg
         self.index = build_model_index(cfg)
-        self.engines: dict[str, Engine] = {}
-        if cfg.ds4.enabled:
-            self.engines["ds4"] = Ds4Engine(cfg.ds4)
-        if cfg.ollama.enabled:
-            self.engines["ollama"] = OllamaEngine(cfg.ollama)
+        self.engines: dict[str, Engine] = build_engines(cfg)
 
         self.active_engine: str | None = None
         self._swap_lock = asyncio.Lock()
@@ -416,14 +794,22 @@ class EngineManager:
     # -- lifecycle ------------------------------------------------------- #
     async def startup(self) -> None:
         """Detect which engine currently holds the GPU by probing reality."""
-        ds4 = self.engines.get("ds4")
-        ollama = self.engines.get("ollama")
-        if ds4 and await ds4.is_ready():
-            self.active_engine = "ds4"
-        elif ollama and await ollama.loaded_models():
-            self.active_engine = "ollama"
-        else:
-            self.active_engine = None
+        active: str | None = None
+        # Prefer a process-style engine that is already serving.
+        for key, engine in self.engines.items():
+            if isinstance(engine, (Ds4Engine, GenericProcessEngine)):
+                if await engine.is_ready():
+                    active = key
+                    break
+        # Otherwise an API-swap engine with a model resident.
+        if active is None:
+            for key, engine in self.engines.items():
+                if isinstance(engine, APISwapEngine):
+                    if await engine.loaded_models():
+                        active = key
+                        break
+        self.active_engine = active
+        metrics.set_active_engine(active)
         log.info("startup: active engine detected as %s", self.active_engine)
         self._persist()
 
@@ -435,9 +821,10 @@ class EngineManager:
     async def engine_for(self, model_id: str | None) -> Engine:
         """Resolve which engine owns *model_id*.
 
-        Static registry first, then a live Ollama tag lookup (so models pulled
-        after the router started still route correctly), then a best-effort
-        guess (ds4 only ever has its two fixed ids; anything else is Ollama)."""
+        Static registry first, then a live API-swap tag lookup (so models
+        pulled after the router started still route correctly), then a
+        best-effort guess (a process engine's fixed ids; otherwise an
+        API-swap engine that can serve arbitrary tags)."""
         if not model_id:
             raise EngineError("request is missing a 'model' field")
 
@@ -448,27 +835,29 @@ class EngineManager:
                 raise EngineError(f"engine {spec.engine!r} is disabled")
             return engine
 
-        # Unknown id: consult live Ollama tags.
-        ollama = self.engines.get("ollama")
-        if isinstance(ollama, OllamaEngine):
-            tags = await ollama.available_tags()
-            if model_id in tags:
-                return ollama
+        # Unknown id: consult live tags from any API-swap engine (e.g. Ollama).
+        for engine in self.engines.values():
+            if isinstance(engine, APISwapEngine):
+                tags = await engine.available_tags()
+                if model_id in tags:
+                    return engine
 
-        # ds4 advertises a small, fixed set; if it's one of those, use ds4.
-        ds4 = self.engines.get("ds4")
-        if ds4 is not None and any(
-            s.engine == "ds4" and s.id == model_id for s in self.cfg.models
-        ):
-            return ds4
+        # A process engine advertises a small, fixed set; if model_id is one of
+        # those, use that engine.
+        for key, engine in self.engines.items():
+            if isinstance(engine, (Ds4Engine, GenericProcessEngine)) and any(
+                s.engine == key and s.id == model_id for s in self.cfg.models
+            ):
+                return engine
 
-        # Last resort: if only one engine is enabled, use it; else prefer ollama
-        # (it can pull/serve arbitrary tags), otherwise error.
+        # Last resort: if only one engine is enabled, use it; else prefer an
+        # API-swap engine (it can pull/serve arbitrary tags), otherwise error.
         if len(self.engines) == 1:
             return next(iter(self.engines.values()))
-        if ollama is not None:
-            log.warning("unknown model %r; defaulting to ollama", model_id)
-            return ollama
+        for engine in self.engines.values():
+            if isinstance(engine, APISwapEngine):
+                log.warning("unknown model %r; defaulting to %s", model_id, engine.key)
+                return engine
         raise EngineError(f"no engine can serve model {model_id!r}")
 
     # -- acquire / release ---------------------------------------------- #
@@ -497,6 +886,13 @@ class EngineManager:
         prev = self.active_engine
         log.info("SWAP begin: %s -> %s", prev, target.key)
 
+        # Record how many in-flight requests we are about to drain (the cost of
+        # the swap to current traffic). Sum across the engines we will stop.
+        in_flight = sum(
+            self._inflight.get(key, 0) for key in self.engines if key != target.key
+        )
+        metrics.record_in_flight_at_swap_start(in_flight)
+
         # 1. Drain + free whatever currently holds the GPU.
         for key, engine in self.engines.items():
             if key == target.key:
@@ -506,7 +902,9 @@ class EngineManager:
                 await engine.free_vram()
             except EngineError:
                 # Re-raise: if we can't free the GPU we must not start target.
-                self._record_swap(prev, target.key, loop.time() - t0, ok=False)
+                dt = loop.time() - t0
+                self._record_swap(prev, target.key, dt, ok=False)
+                metrics.record_swap(prev, target.key, dt, ok=False)
                 raise
 
         # 1b. If we just freed an active engine, wait for the kernel to reclaim
@@ -521,13 +919,18 @@ class EngineManager:
             await target.ensure_started()
         except EngineError:
             self.active_engine = None
-            self._record_swap(prev, target.key, loop.time() - t0, ok=False)
+            metrics.set_active_engine(None)
+            dt = loop.time() - t0
+            self._record_swap(prev, target.key, dt, ok=False)
+            metrics.record_swap(prev, target.key, dt, ok=False)
             self._persist()
             raise
 
         self.active_engine = target.key
+        metrics.set_active_engine(target.key)
         dt = loop.time() - t0
         self._record_swap(prev, target.key, dt, ok=True)
+        metrics.record_swap(prev, target.key, dt, ok=True)
         self._persist()
         log.info("SWAP done: %s -> %s in %.1fs", prev, target.key, dt)
 
@@ -550,22 +953,26 @@ class EngineManager:
         seconds; we poll MemAvailable and return as soon as it stops rising
         (two consecutive samples within ~1 GiB), or after *timeout_s*."""
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout_s
+        t0 = loop.time()
+        deadline = t0 + timeout_s
         prev = -1
         stable = 0
         while loop.time() < deadline:
             avail = self._read_mem_available_kb()
             if avail is None:
+                metrics.record_memory_settle(loop.time() - t0)
                 return  # can't read meminfo — don't block the swap
             if prev >= 0 and (avail - prev) < 1_000_000:  # rose < ~1 GiB
                 stable += 1
                 if stable >= 2:
                     log.info("memory settled: %.1f GiB available", avail / 1048576)
+                    metrics.record_memory_settle(loop.time() - t0)
                     return
             else:
                 stable = 0
             prev = avail
             await asyncio.sleep(0.5)
+        metrics.record_memory_settle(loop.time() - t0)
         log.warning(
             "memory-settle wait hit %.0fs timeout (available=%.1f GiB)",
             timeout_s,
@@ -622,9 +1029,9 @@ class EngineManager:
                 "in_flight": self._inflight.get(key, 0),
                 "base_url": engine.base_url,
             }
-            if isinstance(engine, OllamaEngine):
+            if isinstance(engine, APISwapEngine):
                 entry["loaded_models"] = await engine.loaded_models()
-            if isinstance(engine, Ds4Engine):
+            if isinstance(engine, (Ds4Engine, GenericProcessEngine)):
                 entry["process_running"] = engine.is_running()
             engines[key] = entry
         return {
