@@ -138,7 +138,17 @@ def cmd_models(_args: argparse.Namespace) -> None:
 
 def cmd_use(args: argparse.Namespace) -> None:
     target = args.target
-    if target in ("ds4", "ollama"):
+    # Decide whether the target is an engine KEY or a model id. Engine keys are
+    # discovered live from /status (so generic engines:-table keys like
+    # "llamacpp"/"tabby" work, not just the literal ds4/ollama), with a static
+    # fallback if the router can't be reached for the lookup.
+    engine_keys = {"ds4", "ollama"}
+    try:
+        st0 = _get("/status")
+        engine_keys = set((st0.get("engines") or {}).keys()) or engine_keys
+    except SystemExit:
+        pass  # _get already printed a connection error; fall back to defaults
+    if target in engine_keys:
         body: dict = {"engine": target}
     else:
         body = {"model": target}
@@ -199,14 +209,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("logs", help="tail the router log (journalctl or file fallback)")
 
     use_p = sub.add_parser("use", help="swap to an engine or model")
-    use_p.add_argument("target", help="engine key (ds4|ollama) or a model id")
+    use_p.add_argument("target", help="an engine key (e.g. ds4, ollama, or a generic engines: key) or a model id")
 
-    # Convenience shortcuts for the two engines.
+    # Convenience shortcuts for the two built-in engines.
     sub.add_parser("ds4", help="shortcut: swap to ds4 engine")
     sub.add_parser("ollama", help="shortcut: swap to ollama engine")
 
     for action in ("start", "stop", "restart"):
-        sub.add_parser(action, help=f"sudo systemctl {action} llm-router.service")
+        sub.add_parser(action, help=f"systemctl --user {action} llm-router.service")
 
     return p
 

@@ -6,4 +6,4 @@ engine owns it, and transparently swaps engines (only one heavy model fits in
 the GB10's unified memory at a time) before proxying the request through.
 """
 
-__version__ = "1.0.0"
+__version__ = "0.2.0"

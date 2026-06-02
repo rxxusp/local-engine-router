@@ -10,7 +10,7 @@ Implements the full shared endpoint contract:
   POST /v1/chat/completions       }
   POST /v1/completions            } OpenAI-compatible; route by body["model"]
   POST /v1/embeddings             }
-  POST /v1/messages               } Anthropic-compat forwarded to ds4
+  POST /v1/messages               } Anthropic-compat; route by body["model"]
   POST /v1/responses              }
   POST /api/chat                  } Ollama-native; route by body["model"]
   POST /api/generate              }
@@ -114,7 +114,9 @@ def _find_ollama_engine(manager: EngineManager) -> OllamaEngine | None:
     The Ollama-capable engine used to be looked up by the literal key
     "ollama", but with the generic ``engines:`` table a user can key it under
     any name. Resolve it by type instead so /v1/models tag enrichment and the
-    /api/* passthrough keep working regardless of the configured key.
+    /api/* passthrough keep working regardless of the configured key. If more
+    than one OllamaEngine is configured, the first (by insertion order) is used
+    — the /api/* passthrough and tag enrichment bind to that one.
     """
     for engine in manager.engines.values():
         if isinstance(engine, OllamaEngine):
