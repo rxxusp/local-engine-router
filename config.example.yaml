@@ -83,14 +83,18 @@ ollama:
 #     # env: { CUDA_VISIBLE_DEVICES: "0" }   # extra env (merged over os.environ)
 #     # cwd: /opt/llama.cpp                  # working dir (optional)
 #     ready_path: /health                    # polled for HTTP 200 until ready
-#     start_timeout_s: 300                   # vLLM/SGLang can take minutes
-#     stop_signal: SIGTERM                   # SIGTERM->SIGKILL + port-close check
+#     start_timeout_s: 300                   # vLLM/SGLang can take minutes (SGLang+compile: >=600)
+#     stop_signal: SIGTERM                   # whole process GROUP, SIGTERM->SIGKILL + port-close check
 #     stop_timeout_s: 30
-#     # process_pattern: llama-server        # pgrep -f to reap strays we don't own
+#     # process_pattern: llama-server        # pgrep -f to reap forked workers/strays
 #     # log_file: ./logs/llamacpp.log
+#     # ready_check: "status==ok"            # richer than HTTP 200; "key==value" or "model:<id>".
+#     #                                      # vLLM: set ready_path=/v1/models + ready_check="model:<id>"
+#     #                                      # (vLLM /health is 200 with an EMPTY body before the model can serve)
+#     # control_headers: { Authorization: "Bearer SECRET" }   # sent on control/health calls only
 #
 #   # An engine whose models load/unload over HTTP (router owns no process),
-#   # e.g. TabbyAPI. Required: base_url. unload_path frees VRAM on swap-away.
+#   # e.g. TabbyAPI / LM Studio. Required: base_url. unload_path frees VRAM on swap-away.
 #   tabby:
 #     type: api_swap
 #     enabled: true
@@ -105,6 +109,15 @@ ollama:
 #     unload_timeout_s: 60
 #     # systemd_unit: tabbyapi.service        # best-effort start if unreachable
 #     tags_cache_ttl_s: 30
+#     # --- explicit-load engines (TabbyAPI, text-generation-webui) ---
+#     # load_path: /v1/model/load            # POSTed on acquire to load the requested model
+#     # load_method: POST
+#     # load_body: { model_name: "{model}" } # {model} substituted with the requested id
+#     # load_timeout_s: 120
+#     # --- secured / multi-instance engines (e.g. TabbyAPI x-admin-key, LM Studio) ---
+#     # control_headers: { x-admin-key: "SECRET" }   # auth on control/load/unload calls only
+#     # loaded_filter: "state==loaded"       # keep only entries that are actually loaded
+#     # loaded_id_key: instance_id           # unload identifier when distinct from the name (LM Studio)
 #
 # models:
 #   - id: qwen2.5-7b-instruct
@@ -124,3 +137,12 @@ models:
     engine: ollama
     display_name: Qwen3.6 Uncensored 27B
     context_length: 262144
+
+# Optional alias map: { alias -> real model id }. A request for an alias is
+# routed to the real model AND the outgoing body's "model" is rewritten to the
+# real id, so OpenAI/Anthropic clients that send a fixed name (Claude Code,
+# SDK defaults) reach a local model. An alias must not shadow a real model id
+# and must point at a real id (no alias->alias chains).
+# aliases:
+#   gpt-4o-mini: qwen3.6-uncensored:27b
+#   claude-3-5-sonnet: deepseek-v4-flash
