@@ -162,7 +162,7 @@ def _generic_table_config() -> RouterConfig:
             ModelSpec(id="local-gguf", engine="llamacpp", display_name="gguf"),
             ModelSpec(id="tabby-exl2", engine="tabby", display_name="exl2"),
         ],
-        state_file="/tmp/llm-router-test-state.json",
+        state_file="/tmp/local-engine-router-test-state.json",
         drain_timeout_s=0.5,
     )
 

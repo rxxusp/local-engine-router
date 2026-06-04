@@ -21,7 +21,11 @@ from router.config import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# A live deployment's config.yaml is gitignored; fall back to the shipped
+# example so this test also runs on a fresh clone / CI.
 REAL_CONFIG = REPO_ROOT / "config.yaml"
+if not REAL_CONFIG.exists():
+    REAL_CONFIG = REPO_ROOT / "config.example.yaml"
 
 
 def _write(tmp_path, text: str) -> str:
@@ -43,7 +47,7 @@ def test_load_real_config_yaml():
     # A couple of known ids from the shipped config.
     ids = {m.id for m in cfg.models}
     assert "deepseek-v4-flash" in ids
-    assert "qwen2.5:3b" in ids
+    assert "qwen3.6-uncensored:27b" in ids
 
 
 def test_dangling_model_engine_ref_raises(tmp_path):

@@ -1,0 +1,21 @@
+[Unit]
+Description=local-engine-router (single-port switchboard for local LLM engines on :8077)
+# Installed as a *user* unit (~/.config/systemd/user/) so it shares the same
+# `systemctl --user` manager as the engine units it starts/stops (e.g.
+# ds4.service). Lingering (loginctl enable-linger) makes it start at boot
+# without a login session. %h expands to the user's home directory.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/local-engine-router
+Environment=PYTHONUNBUFFERED=1
+Environment=ROUTER_CONFIG=%h/local-engine-router/config.yaml
+ExecStart=/usr/bin/python3 -m router --config %h/local-engine-router/config.yaml
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

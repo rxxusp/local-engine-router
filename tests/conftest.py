@@ -1,4 +1,4 @@
-"""Shared fixtures + fakes for the llm-router test suite.
+"""Shared fixtures + fakes for the local-engine-router test suite.
 
 Everything here is hermetic: no GPU, no systemd, no real engine process, and no
 network egress. The two big helpers are:
@@ -195,7 +195,7 @@ def make_config(
         swap_memory_settle_timeout_s=overrides.pop("swap_memory_settle_timeout_s", 0.2),
         swap_keepalive_interval_s=overrides.pop("swap_keepalive_interval_s", 0.05),
         # Avoid writing into the real repo state.json during tests.
-        state_file=overrides.pop("state_file", "/tmp/llm-router-test-state.json"),
+        state_file=overrides.pop("state_file", "/tmp/local-engine-router-test-state.json"),
         **overrides,
     )
     return cfg
