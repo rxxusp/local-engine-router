@@ -308,6 +308,12 @@ class RouterConfig:
     # Upstream connect timeout for user traffic. Read timeout is intentionally
     # unbounded (long generations / streaming).
     upstream_connect_timeout_s: float = 15.0
+    # The /api/* catch-all forwards unmatched Ollama management endpoints.
+    # Destructive ones (delete, create, copy, push, blobs) are refused with 403
+    # unless this is true — otherwise ANY client that can reach the router can
+    # delete/overwrite/upload local models, even with api_keys unset. /api/pull
+    # stays available (it has an explicit route) but is covered by api_keys.
+    allow_destructive_ollama_api: bool = False
     ds4: Ds4Config = field(default_factory=Ds4Config)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     # Optional generic engine table. Empty == legacy ds4/ollama mode (built from
