@@ -32,6 +32,13 @@ swap_keepalive_interval_s: 5.0
 # Wait this long for in-flight requests to finish before stopping an engine.
 drain_timeout_s: 30.0
 upstream_connect_timeout_s: 15.0
+
+# Destructive Ollama management endpoints (/api/delete, /api/create, /api/copy,
+# /api/push, /api/blobs) are refused through the router's /api/* passthrough by
+# default — anyone who can reach the router could otherwise delete or overwrite
+# local models, even when api_keys is unset. Set true only if you trust every
+# client that can reach the port.
+allow_destructive_ollama_api: false
 # After freeing one engine, wait for the kernel to reclaim its (unified) memory
 # before starting the next — ends as soon as free memory plateaus, capped here.
 swap_memory_settle_timeout_s: 25.0

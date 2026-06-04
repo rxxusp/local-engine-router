@@ -80,6 +80,10 @@ def sse_error_chunk(exc: Exception) -> bytes:
 # and the Prometheus scrape endpoint (scrapers must reach /metrics keyless).
 _AUTH_EXEMPT_PATHS = frozenset({"/health", "/metrics"})
 
+# First path segment of /api/* endpoints that mutate the engine's model store.
+# Refused by the catch-all passthrough unless cfg.allow_destructive_ollama_api.
+_DESTRUCTIVE_API_SEGMENTS = frozenset({"delete", "create", "copy", "push", "blobs"})
+
 
 def _extract_api_key(headers) -> str | None:
     """Pull the API key from Authorization: Bearer <key> or X-API-Key."""
@@ -701,9 +705,26 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         return await _passthrough_to_ollama(request, "/api/pull")
 
     # Catch-all for any other /api/* paths not handled above — passthrough
-    # to ollama without swap (management endpoints).
+    # to ollama without swap (management endpoints). Destructive endpoints are
+    # refused unless explicitly enabled in config: /api/delete removes local
+    # models, /api/create + /api/blobs write new ones, /api/copy clones,
+    # /api/push uploads to a registry — none of which a chat client needs, and
+    # all of which would otherwise be exposed to anyone who can reach the
+    # router (defeating a firewall that blocks direct access to Ollama).
     @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def api_catchall(request: Request, path: str) -> Response:
+        head = path.split("/", 1)[0].lower()
+        if head in _DESTRUCTIVE_API_SEGMENTS and not cfg.allow_destructive_ollama_api:
+            return JSONResponse(
+                _openai_error(
+                    f"/api/{head} is disabled through the router; set "
+                    "'allow_destructive_ollama_api: true' in the router config "
+                    "to enable it, or call the engine directly from its host",
+                    "permission_error",
+                    "destructive_api_disabled",
+                ),
+                status_code=403,
+            )
         return await _passthrough_to_ollama(request, f"/api/{path}")
 
     return app
