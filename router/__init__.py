@@ -1,4 +1,4 @@
-"""llm-router: a single-GPU model switchboard.
+"""local-engine-router: a single-GPU model switchboard.
 
 A small OpenAI- and Ollama-compatible reverse proxy that sits in front of the
 local ds4 engine and Ollama. It reads the requested model, figures out which

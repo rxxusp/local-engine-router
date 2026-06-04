@@ -32,7 +32,7 @@ four things no maintained tool does today:
 4. **Upstream-independent keep-alive** during long cold starts — on **both**
    `/v1/*` SSE streams and `/api/*` NDJSON streams.
 
-> The Python package is `router` and the systemd unit is `llm-router`; the
+> The Python package is `router` and the systemd unit is `local-engine-router`; the
 > project/repo is **local-engine-router**. Licensed **MIT** (attribution to
 > `rxxusp`). See [`roadmap/ROADMAP.md`](roadmap/ROADMAP.md) for where this is headed.
 
@@ -42,7 +42,7 @@ The router is pure Python (`fastapi`, `uvicorn`, `httpx`, `pyyaml`) and needs no
 GPU. Python ≥ 3.10.
 
 ```bash
-# From a checkout (editable for dev): installs console scripts llm-router + routerctl
+# From a checkout (editable for dev): installs console scripts local-engine-router + routerctl
 pip install .
 
 # Or isolated, via pipx:
@@ -50,7 +50,7 @@ pipx install .
 
 # Then run it:
 cp config.example.yaml config.yaml       # edit for your machine
-llm-router --config config.yaml          # console script
+local-engine-router --config config.yaml          # console script
 python3 -m router --config config.yaml   # equivalent module form
 # or, for the systemd user service: bash deploy/install.sh
 ```
@@ -103,7 +103,7 @@ in `config.yaml` — and then set `api_keys` (see below) or rely on a host firew
 
 ```
                         ┌─────────────────────────────────────────┐
-  OpenCode              │              llm-router :8077            │
+  OpenCode              │              local-engine-router :8077            │
   (localhost)  ──────►  │                                         │
                         │  POST /v1/chat/completions               │
   Open WebUI            │       /v1/completions                    │
@@ -229,7 +229,7 @@ upstream read timeout is unbounded; only `upstream_connect_timeout_s` is bounded
 | POST | `/api/generate` | Ollama-native generate; routed by `body.model` |
 | POST | `/api/embeddings` | Ollama-native embeddings; routed by `body.model` |
 | POST | `/api/embed` | Ollama-native embed; routed by `body.model` |
-| GET/POST | `/api/tags`, `/api/ps`, `/api/version`, `/api/show`, `/api/pull`, `/api/*` | Passthrough to Ollama, no swap (management/catalog) |
+| GET/POST | `/api/tags`, `/api/ps`, `/api/version`, `/api/show`, `/api/pull`, `/api/*` | Passthrough to Ollama, no swap (management/catalog). Destructive endpoints (`/api/delete`, `/api/create`, `/api/copy`, `/api/push`, `/api/blobs`) are refused with 403 unless `allow_destructive_ollama_api: true` — anyone who can reach the router could otherwise mutate the local model store. |
 | POST | `/admin/swap` | Body: `{"model":"<id>"}` or `{"engine":"<engine_key>"}`. Proactive swap; returns `status()`. 400 if neither field. |
 
 
@@ -242,6 +242,7 @@ Top-level keys:
 | `host` | `127.0.0.1` | Bind address. Use `0.0.0.0` to expose off-localhost (pair with `api_keys` or a firewall). |
 | `port` | `8077` | Listen port |
 | `api_keys` | `[]` | If non-empty, require a key (`Authorization: Bearer` / `X-API-Key`) on all requests except `GET /health` |
+| `allow_destructive_ollama_api` | `false` | Allow `/api/delete`, `/api/create`, `/api/copy`, `/api/push`, `/api/blobs` through the passthrough (refused with 403 when false) |
 | `log_level` | `INFO` | Python log level |
 | `log_file` | `logs/router.log` | Rotating log (5 MB × 3 backups) |
 | `state_file` | `state.json` | Persisted active-engine snapshot |
@@ -259,7 +260,7 @@ Top-level keys:
 | `base_url` | `http://172.17.0.1:8099` | How the router reaches ds4 |
 | `control` | `systemd-user` | How the router controls ds4: `systemd-user` (start/stop the user unit) or `process` (launch serve.sh + SIGTERM) |
 | `systemd_user_unit` | `ds4.service` | The `systemctl --user` unit to start/stop (control=systemd-user) |
-| `serve_script` | `/home/grahamfm/ds4/serve.sh` | Script to launch ds4-server (control=process fallback) |
+| `serve_script` | `/path/to/ds4/serve.sh` | Script to launch ds4-server (control=process fallback) |
 | `process_pattern` | `ds4/ds4-server` | `pgrep -f` pattern used to confirm the process is gone after stop |
 | `health_path` | `/v1/models` | Readiness probe path (returns 200 when ready) |
 | `start_timeout_s` | `240.0` | Max wait for ds4 to become ready (~81 GB model) |
@@ -472,19 +473,19 @@ bash deploy/install.sh
 
 # Equivalent manual steps:
 mkdir -p ~/.config/systemd/user
-cp deploy/llm-router.service ~/.config/systemd/user/
+cp deploy/local-engine-router.service ~/.config/systemd/user/
 sudo loginctl enable-linger "$USER"      # boot-start without login (one-time)
 systemctl --user daemon-reload
-systemctl --user enable --now llm-router
+systemctl --user enable --now local-engine-router
 ```
 
 ### Start / stop / restart
 
 ```bash
-systemctl --user start   llm-router
-systemctl --user stop     llm-router
-systemctl --user restart llm-router
-systemctl --user status  llm-router
+systemctl --user start   local-engine-router
+systemctl --user stop     local-engine-router
+systemctl --user restart local-engine-router
+systemctl --user status  local-engine-router
 # or: routerctl start | stop | restart | status
 ```
 
@@ -497,11 +498,11 @@ not touch ds4.
 
 ```bash
 # Rotating file (5 MB × 3 backups)
-tail -f /home/grahamfm/llm-router/logs/router.log
+tail -f ~/local-engine-router/logs/router.log
 
 # systemd journal (user unit)
-journalctl --user -u llm-router -f
-journalctl --user -u llm-router --since "1 hour ago"
+journalctl --user -u local-engine-router -f
+journalctl --user -u local-engine-router --since "1 hour ago"
 
 # ds4-server output goes to its own unit's journal:
 journalctl --user -u ds4 -f
@@ -509,7 +510,7 @@ journalctl --user -u ds4 -f
 
 ### State file
 
-`/home/grahamfm/llm-router/state.json` is written after every swap and on
+`~/local-engine-router/state.json` is written after every swap and on
 startup. It holds the last known active engine and last swap details. It is a
 snapshot only — the router re-probes reality on startup rather than trusting it.
 
@@ -558,7 +559,7 @@ ollama stop <name>
 ```bash
 ss -tlnp | grep 8077
 # If another process has it:
-systemctl --user stop llm-router
+systemctl --user stop local-engine-router
 # or kill the offending pid and restart
 ```
 

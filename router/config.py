@@ -1,4 +1,4 @@
-"""Configuration model and loader for llm-router.
+"""Configuration model and loader for local-engine-router.
 
 The config is plain YAML (see config.yaml). Everything has a sensible default
 baked in here so the YAML file can stay small. The dataclasses below are the
@@ -98,7 +98,7 @@ class Ds4Config:
     # The user systemd unit that runs ds4 (control="systemd-user").
     systemd_user_unit: str = "ds4.service"
     # Script that launches ds4-server (control="process"; it `exec`s the binary).
-    serve_script: str = "/home/grahamfm/ds4/serve.sh"
+    serve_script: str = ""
     # pgrep -f pattern used to find/stop the ds4-server process (control="process").
     process_pattern: str = "ds4/ds4-server"
     # Path used as a readiness probe (ds4 has no /health; /v1/models returns 200).
@@ -109,7 +109,7 @@ class Ds4Config:
     # Seconds to wait for the process to exit + VRAM to free after stop.
     stop_timeout_s: float = 45.0
     # Where ds4-server stdout/stderr is appended when control="process".
-    log_file: str = "/home/grahamfm/llm-router/logs/ds4-server.log"
+    log_file: str = "./logs/ds4-server.log"
     # Optional headers sent on every control/health call the router makes to
     # this engine (NOT user traffic). Default {} = unchanged (no auth header).
     control_headers: dict[str, str] = field(default_factory=dict)
@@ -288,11 +288,11 @@ class RouterConfig:
     # present one via `Authorization: Bearer <key>` or `X-API-Key: <key>`.
     # Empty list = no authentication (fine for a localhost-only bind).
     api_keys: list[str] = field(default_factory=list)
-    log_file: str = "/home/grahamfm/llm-router/logs/router.log"
+    log_file: str = "./logs/router.log"
     log_level: str = "INFO"
     # Persisted observability snapshot (active engine, last swap). Not trusted
     # as ground truth on startup — the manager re-probes reality.
-    state_file: str = "/home/grahamfm/llm-router/state.json"
+    state_file: str = "./state.json"
     # Cadence of SSE keep-alive comments emitted to streaming clients while a
     # swap is in progress, so they don't hit an idle/TTFB timeout.
     swap_keepalive_interval_s: float = 5.0
@@ -735,9 +735,9 @@ def config_json_schema() -> dict[str, Any]:
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://github.com/rxxusp/local-engine-router/config.schema.json",
-        "title": "llm-router configuration",
+        "title": "local-engine-router configuration",
         "description": (
-            "Configuration schema for llm-router (local-engine-router). Unknown "
+            "Configuration schema for local-engine-router (local-engine-router). Unknown "
             "keys are accepted with a warning for forward compatibility."
         ),
         **root,

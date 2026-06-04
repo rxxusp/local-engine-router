@@ -67,7 +67,7 @@ the new pieces.
   `memory_settle_seconds`, `in_flight_at_swap_start` (histograms),
   `swap_total{from,to,result}` (counter), and `engine_uptime_seconds` (gauge).
   No new dependency — the text exposition is hand-rolled.
-- **Packaging**: `pyproject.toml` with console scripts `llm-router`
+- **Packaging**: `pyproject.toml` with console scripts `local-engine-router`
   (`router.__main__:main`) and `routerctl` (`router.cli:main`), and a `[dev]`
   extra (pytest, pytest-asyncio). A pure-Python `Dockerfile`
   (`python:3.12-slim`, no CUDA) and a `docker-publish` GitHub Actions workflow

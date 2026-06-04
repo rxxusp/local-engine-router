@@ -1,4 +1,4 @@
-# Open WebUI wiring: route through llm-router
+# Open WebUI wiring: route through local-engine-router
 
 The router is reachable from inside the `open-webui` container at
 `http://host.docker.internal:8077` (the bridge gateway is `172.17.0.1`, mapped
@@ -56,7 +56,7 @@ docker run -d \
   --add-host=host.docker.internal:host-gateway \
   -p 8080:8080 \
   -v open-webui:/app/backend/data \
-  -v /home/grahamfm/models:/models \
+  -v /path/to/models:/models \
   -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
   -e OPENAI_API_BASE_URL=http://host.docker.internal:8077/v1 \
   -e OPENAI_API_KEY="" \

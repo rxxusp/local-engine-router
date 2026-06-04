@@ -68,7 +68,7 @@ GB10). Four things no maintained tool does today:
       `/v1/*` AND bare-newline holding frames on `/api/*` NDJSON. Remaining
       caveat (documented): non-stream callers must raise their read-timeout.
 - [x] **3. Packaging** *(v0.2.0)* — `pyproject.toml` (console scripts
-      `llm-router` + `routerctl`), a pure-Python `Dockerfile` (`python:3.12-slim`,
+      `local-engine-router` + `routerctl`), a pure-Python `Dockerfile` (`python:3.12-slim`,
       no CUDA — a pinned-CUDA base was rejected as needless bloat), and a
       `docker-publish` workflow pushing to `ghcr.io`.
 - [x] **4. Tests + CI** *(v0.2.0)* — 69 hermetic pytest tests (no GPU/network,
@@ -94,7 +94,7 @@ GB10). Four things no maintained tool does today:
 ## Ideas / later
 - Priority-based preemption (pin a high-priority engine; queue/preempt others) —
   borrowed concept from the SwapServeLLM research prototype.
-- Optional rename of the internal package/service (`router` / `llm-router`) to
+- Optional rename of the internal package/service (`router` / `local-engine-router`) to
   match the repo name (`local-engine-router`).
 - Optional concurrent-model support (run >1 small model when memory allows).
 

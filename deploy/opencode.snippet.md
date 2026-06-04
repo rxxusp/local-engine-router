@@ -1,4 +1,4 @@
-# OpenCode wiring: route both providers through llm-router
+# OpenCode wiring: route both providers through local-engine-router
 
 After the router is running on `:8077`, update `~/.config/opencode/opencode.json`
 so both provider `options.baseURL` values point at the router instead of the
