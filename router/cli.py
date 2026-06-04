@@ -1,7 +1,11 @@
 """routerctl — CLI control tool for llm-router.
 
-Uses only stdlib: urllib.request, json, argparse, subprocess.
+Uses only stdlib: urllib.request, json, argparse, subprocess. (PyYAML — already
+a router dependency — is used opportunistically to discover the API key from
+the router config; its absence is tolerated.)
 Base URL: $ROUTER_URL or http://127.0.0.1:8077
+API key:  $ROUTER_API_KEY, else api_keys[0] from $ROUTER_CONFIG /
+          <repo>/config.yaml (sent as Authorization: Bearer when present)
 
 This is the importable home of the ``routerctl`` command. The top-level
 ``./routerctl`` script in a checkout is a thin shim that calls :func:`main`
@@ -21,7 +25,37 @@ import urllib.request
 from typing import Any
 
 BASE_URL = os.environ.get("ROUTER_URL", "http://127.0.0.1:8077").rstrip("/")
-LOG_FILE = "/home/grahamfm/llm-router/logs/router.log"
+# Repo root when running from a checkout (router/cli.py -> repo/). Defaults
+# derive from it so a checkout needs no env vars; both are overridable.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_FILE = os.environ.get(
+    "ROUTER_LOG_FILE", os.path.join(_REPO_ROOT, "logs", "router.log")
+)
+
+
+def _api_key() -> str | None:
+    """API key for the router, if it requires one.
+
+    $ROUTER_API_KEY wins; otherwise a best-effort read of api_keys[0] from the
+    router config ($ROUTER_CONFIG or <repo>/config.yaml)."""
+    key = os.environ.get("ROUTER_API_KEY")
+    if key:
+        return key
+    cfg_path = os.environ.get(
+        "ROUTER_CONFIG", os.path.join(_REPO_ROOT, "config.yaml")
+    )
+    try:
+        import yaml
+        with open(cfg_path) as fh:
+            keys = (yaml.safe_load(fh) or {}).get("api_keys") or []
+        return str(keys[0]) if keys else None
+    except Exception:
+        return None
+
+
+def _auth_headers() -> dict[str, str]:
+    key = _api_key()
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 # --------------------------------------------------------------------------- #
@@ -31,7 +65,7 @@ LOG_FILE = "/home/grahamfm/llm-router/logs/router.log"
 def _get(path: str, timeout: float = 15.0) -> Any:
     """GET BASE_URL+path, return parsed JSON."""
     url = BASE_URL + path
-    req = urllib.request.Request(url, method="GET")
+    req = urllib.request.Request(url, headers=_auth_headers(), method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
@@ -46,7 +80,7 @@ def _post(path: str, body: dict, timeout: float = 15.0) -> Any:
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **_auth_headers()},
         method="POST",
     )
     try:
