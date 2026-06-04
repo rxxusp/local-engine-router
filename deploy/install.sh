@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# install.sh  — idempotent installer for llm-router.
+# install.sh  — idempotent installer for local-engine-router.
 # Safe to re-run at any time.
 # ---------------------------------------------------------------------------
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-echo "==> llm-router install (repo: $REPO_ROOT)"
+echo "==> local-engine-router install (repo: $REPO_ROOT)"
 
 # 1. Verify Python dependencies -------------------------------------------
 echo "==> checking Python dependencies..."
@@ -34,11 +34,11 @@ mkdir -p "$REPO_ROOT/logs"
 # 3. Install systemd *user* unit -------------------------------------------
 # The router runs as a user unit so it shares the same `systemctl --user`
 # manager as ds4.service and can start/stop it. (A system unit running as
-# User=grahamfm cannot reliably control the user manager.)
+# User=<you> cannot reliably control the user manager.)
 UNIT_DIR="$HOME/.config/systemd/user"
 echo "==> installing user systemd unit to $UNIT_DIR ..."
 mkdir -p "$UNIT_DIR"
-cp "$REPO_ROOT/deploy/llm-router.service" "$UNIT_DIR/llm-router.service"
+cp "$REPO_ROOT/deploy/local-engine-router.service" "$UNIT_DIR/local-engine-router.service"
 
 # 4. Enable lingering so the user manager (and the router) start at boot ----
 echo "==> ensuring lingering is enabled for $USER (boot start without login)..."
@@ -52,9 +52,9 @@ if command -v loginctl >/dev/null 2>&1; then
 fi
 
 # 5. Reload + enable + start -----------------------------------------------
-echo "==> enabling and starting llm-router.service (user)..."
+echo "==> enabling and starting local-engine-router.service (user)..."
 systemctl --user daemon-reload
-systemctl --user enable --now llm-router.service
+systemctl --user enable --now local-engine-router.service
 
 # 6. Install routerctl into PATH ------------------------------------------
 echo "==> installing routerctl to ~/.local/bin ..."
@@ -81,7 +81,7 @@ done
 if [ "$HEALTHY" -eq 0 ]; then
     echo ""
     echo "ERROR: router did not become healthy within 30 s."
-    echo "       Check logs with: journalctl --user -u llm-router -n 50"
+    echo "       Check logs with: journalctl --user -u local-engine-router -n 50"
     exit 1
 fi
 
@@ -112,9 +112,9 @@ routerctl usage:
   routerctl restart          — restart the router service
 
 Service management (user unit):
-  systemctl --user status llm-router
-  systemctl --user restart llm-router
-  journalctl --user -u llm-router -f
+  systemctl --user status local-engine-router
+  systemctl --user restart local-engine-router
+  journalctl --user -u local-engine-router -f
 
 =======================================================================
 EOF

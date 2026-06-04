@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/rxxusp/local-engine-router/config.schema.json",
-  "title": "llm-router configuration",
-  "description": "Configuration schema for llm-router (local-engine-router). Unknown keys are accepted with a warning for forward compatibility.",
+  "title": "local-engine-router configuration",
+  "description": "Configuration schema for local-engine-router (local-engine-router). Unknown keys are accepted with a warning for forward compatibility.",
   "type": "object",
   "properties": {
     "host": {
@@ -21,7 +21,7 @@
     },
     "log_file": {
       "type": "string",
-      "default": "/home/grahamfm/llm-router/logs/router.log"
+      "default": "./logs/router.log"
     },
     "log_level": {
       "type": "string",
@@ -29,7 +29,7 @@
     },
     "state_file": {
       "type": "string",
-      "default": "/home/grahamfm/llm-router/state.json"
+      "default": "./state.json"
     },
     "swap_keepalive_interval_s": {
       "type": "number",
@@ -80,7 +80,7 @@
         },
         "serve_script": {
           "type": "string",
-          "default": "/home/grahamfm/ds4/serve.sh"
+          "default": ""
         },
         "process_pattern": {
           "type": "string",
@@ -100,7 +100,7 @@
         },
         "log_file": {
           "type": "string",
-          "default": "/home/grahamfm/llm-router/logs/ds4-server.log"
+          "default": "./logs/ds4-server.log"
         },
         "control_headers": {
           "type": "object",
@@ -172,7 +172,7 @@
               },
               "serve_script": {
                 "type": "string",
-                "default": "/home/grahamfm/ds4/serve.sh"
+                "default": ""
               },
               "process_pattern": {
                 "type": "string",
@@ -192,7 +192,7 @@
               },
               "log_file": {
                 "type": "string",
-                "default": "/home/grahamfm/llm-router/logs/ds4-server.log"
+                "default": "./logs/ds4-server.log"
               },
               "control_headers": {
                 "type": "object",

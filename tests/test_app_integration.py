@@ -35,7 +35,7 @@ def _app_config(mock_base: str, *, api_keys=None, aliases=None) -> RouterConfig:
         port=8077,
         api_keys=list(api_keys or []),
         aliases=dict(aliases or {}),
-        state_file="/tmp/llm-router-test-state.json",
+        state_file="/tmp/local-engine-router-test-state.json",
         drain_timeout_s=0.5,
         swap_memory_settle_timeout_s=0.1,
         swap_keepalive_interval_s=0.05,

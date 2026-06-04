@@ -1,4 +1,4 @@
-"""FastAPI application for llm-router.
+"""FastAPI application for local-engine-router.
 
 Implements the full shared endpoint contract:
 
@@ -178,7 +178,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
             await manager.aclose()
             log.info("router: shutdown complete")
 
-    app = FastAPI(title="llm-router", lifespan=lifespan)
+    app = FastAPI(title="local-engine-router", lifespan=lifespan)
 
     # -----------------------------------------------------------------------
     # API-key auth (only installed when api_keys are configured)
@@ -239,9 +239,9 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         )
         html = f"""<!DOCTYPE html>
 <html>
-<head><title>llm-router</title></head>
+<head><title>local-engine-router</title></head>
 <body>
-<h1>llm-router</h1>
+<h1>local-engine-router</h1>
 <p><strong>Active engine:</strong> {active}</p>
 <h2>Models</h2>
 <ul>{models_html}</ul>

@@ -1,4 +1,4 @@
-"""HTTP proxy plumbing for llm-router.
+"""HTTP proxy plumbing for local-engine-router.
 
 Provides:
   - make_client(cfg)       — factory for the long-lived httpx.AsyncClient used

@@ -19,8 +19,11 @@ import sys
 
 from .config import ConfigError, config_json_schema, configure_logging, load_config
 
+# Default to the checkout's config.yaml (router/__main__.py -> repo/);
+# $ROUTER_CONFIG or --config override.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CONFIG = os.environ.get(
-    "ROUTER_CONFIG", "/home/grahamfm/llm-router/config.yaml"
+    "ROUTER_CONFIG", os.path.join(_REPO_ROOT, "config.yaml")
 )
 
 
@@ -61,7 +64,7 @@ def main() -> None:
     cfg = load_config(args.config)
     configure_logging(cfg)
     log = logging.getLogger("router")
-    log.info("llm-router starting on %s:%s (config=%s)", cfg.host, cfg.port, args.config)
+    log.info("local-engine-router starting on %s:%s (config=%s)", cfg.host, cfg.port, args.config)
 
     # Imported here so logging is configured first.
     from .app import create_app

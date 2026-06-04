@@ -1,4 +1,4 @@
-"""Zero-dependency in-process metrics for llm-router.
+"""Zero-dependency in-process metrics for local-engine-router.
 
 ``prometheus_client`` is intentionally NOT a dependency, so this module
 hand-rolls the Prometheus text exposition format (version 0.0.4). It is a tiny

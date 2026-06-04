@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# smoke_test.sh — End-to-end smoke test for llm-router.
+# smoke_test.sh — End-to-end smoke test for local-engine-router.
 #
 # WARNING: This script performs REAL engine swaps. Steps 3, 5, and 7 send
 # actual requests to GPU-backed models and will trigger ds4<->ollama swaps.

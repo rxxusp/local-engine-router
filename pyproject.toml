@@ -33,7 +33,7 @@ Homepage = "https://github.com/rxxusp/local-engine-router"
 Repository = "https://github.com/rxxusp/local-engine-router"
 
 [project.scripts]
-llm-router = "router.__main__:main"
+local-engine-router = "router.__main__:main"
 routerctl = "router.cli:main"
 
 [tool.setuptools]

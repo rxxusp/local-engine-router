@@ -1,4 +1,4 @@
-"""routerctl — CLI control tool for llm-router.
+"""routerctl — CLI control tool for local-engine-router.
 
 Uses only stdlib: urllib.request, json, argparse, subprocess. (PyYAML — already
 a router dependency — is used opportunistically to discover the API key from
@@ -199,7 +199,7 @@ def cmd_health(_args: argparse.Namespace) -> None:
 def cmd_logs(_args: argparse.Namespace) -> None:
     # Try journalctl (user unit) first; fall back to tail -f of the log file.
     try:
-        subprocess.run(["journalctl", "--user", "-u", "llm-router", "-f"])
+        subprocess.run(["journalctl", "--user", "-u", "local-engine-router", "-f"])
     except (OSError, KeyboardInterrupt):
         try:
             subprocess.run(["tail", "-f", LOG_FILE])
@@ -215,7 +215,7 @@ def cmd_service(args: argparse.Namespace) -> None:
     # The router is a *user* unit, so no sudo and the --user flag.
     try:
         subprocess.run(
-            ["systemctl", "--user", action, "llm-router.service"],
+            ["systemctl", "--user", action, "local-engine-router.service"],
             check=True,
         )
     except subprocess.CalledProcessError as exc:
@@ -233,7 +233,7 @@ def cmd_service(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="routerctl",
-        description="Control tool for llm-router. Base URL: $ROUTER_URL or http://127.0.0.1:8077",
+        description="Control tool for local-engine-router. Base URL: $ROUTER_URL or http://127.0.0.1:8077",
     )
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -250,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("ollama", help="shortcut: swap to ollama engine")
 
     for action in ("start", "stop", "restart"):
-        sub.add_parser(action, help=f"systemctl --user {action} llm-router.service")
+        sub.add_parser(action, help=f"systemctl --user {action} local-engine-router.service")
 
     return p
 
