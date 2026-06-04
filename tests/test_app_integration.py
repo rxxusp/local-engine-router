@@ -314,3 +314,38 @@ async def test_non_alias_request_body_unchanged(mock_upstream):
         )
         assert r.status_code == 200
         assert r.json()["model"] == "deepseek-v4-flash"
+
+
+# --------------------------------------------------------------------------- #
+# Destructive Ollama management endpoints are refused by the catch-all unless
+# allow_destructive_ollama_api is set (defense in depth: a firewall blocking
+# direct Ollama access must not be bypassable through the router).
+# --------------------------------------------------------------------------- #
+async def test_destructive_api_blocked_by_default(mock_upstream):
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, _):
+        for method, path in (
+            ("DELETE", "/api/delete"),
+            ("POST", "/api/create"),
+            ("POST", "/api/copy"),
+            ("POST", "/api/push"),
+            ("POST", "/api/blobs/sha256:abc"),
+        ):
+            r = await client.request(method, path, json={"model": "x"})
+            assert r.status_code == 403, path
+            assert r.json()["error"]["code"] == "destructive_api_disabled"
+
+
+async def test_destructive_api_allowed_when_enabled(mock_upstream):
+    cfg = _app_config(mock_upstream.base_url)
+    cfg.allow_destructive_ollama_api = True
+    async with _client_for(cfg) as (client, _):
+        # The mock upstream has no /api/delete route (404), but the request must
+        # reach it rather than being refused by the router (403).
+        r = await client.request("DELETE", "/api/delete", json={"model": "x"})
+        assert r.status_code != 403
+
+
+async def test_non_destructive_catchall_still_passes_through(mock_upstream):
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, _):
+        r = await client.get("/api/some-future-endpoint")
+        assert r.status_code != 403
