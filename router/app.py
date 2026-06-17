@@ -394,6 +394,17 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                                     timeout=cfg.swap_keepalive_interval_s,
                                 )
                             except asyncio.TimeoutError:
+                                # If the client vanished while we were waiting on
+                                # a swap, stop here — returning runs the finally
+                                # block which cancels the still-pending acquire.
+                                # Polling explicitly (rather than leaning on
+                                # Starlette's cancellation-based disconnect path)
+                                # keeps swap teardown on a normal control-flow path.
+                                if await request.is_disconnected():
+                                    log.info(
+                                        "client gone during swap wait; aborting %s", model
+                                    )
+                                    return
                                 if cfg.swap_keepalive_enabled:
                                     log.debug(
                                         "keepalive: waiting for swap (model=%s)", model
@@ -413,6 +424,24 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                             request.method, url, content=raw_body, headers=fwd_headers
                         ) as up:
                             async for chunk in up.aiter_raw():
+                                # Stop pulling from upstream the moment the client
+                                # disconnects. Breaking exits the client.stream()
+                                # context on a NORMAL control-flow path, so its
+                                # __aexit__ deterministically closes the upstream
+                                # connection and the engine aborts generation.
+                                # We can't rely on Starlette cancelling this
+                                # generator on disconnect: that cleanup runs under
+                                # CancelledError, where the upstream close can be
+                                # interrupted before the engine is told to stop —
+                                # leaving a generation running to completion against
+                                # a dead socket (the orphaned-generation GPU leak
+                                # observed in production).
+                                if await request.is_disconnected():
+                                    log.info(
+                                        "client disconnected; aborting upstream stream %s",
+                                        model,
+                                    )
+                                    break
                                 yield chunk
                     except httpx.HTTPError as exc:
                         log.error("upstream stream error on %s: %s", url, exc)
@@ -556,6 +585,15 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                                     timeout=cfg.swap_keepalive_interval_s,
                                 )
                             except asyncio.TimeoutError:
+                                # Client gone while waiting on a swap: stop and let
+                                # the finally block cancel the pending acquire.
+                                # (See the SSE handler for why we poll explicitly
+                                # rather than rely on Starlette's disconnect path.)
+                                if await request.is_disconnected():
+                                    log.info(
+                                        "client gone during swap wait; aborting %s", model
+                                    )
+                                    return
                                 if cfg.swap_keepalive_enabled:
                                     log.debug(
                                         "keepalive: waiting for swap (model=%s)", model
@@ -577,6 +615,18 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                             request.method, url, content=raw_body, headers=fwd_headers
                         ) as up:
                             async for chunk in up.aiter_raw():
+                                # Abort the upstream pull when the client
+                                # disconnects so the engine stops generating into
+                                # a dead socket. See the SSE handler above for the
+                                # full rationale (a normal-control-flow break closes
+                                # the upstream deterministically; cancellation-based
+                                # cleanup may not).
+                                if await request.is_disconnected():
+                                    log.info(
+                                        "client disconnected; aborting upstream stream %s",
+                                        model,
+                                    )
+                                    break
                                 yield chunk
                     except httpx.HTTPError as exc:
                         log.error("upstream stream error on %s: %s", url, exc)

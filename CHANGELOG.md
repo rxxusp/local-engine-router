@@ -6,6 +6,17 @@ until then it is in a `0.x` channel where minor versions may break.
 
 ## [Unreleased]
 
+### Fixed
+- **Orphaned upstream generations on client disconnect** — streaming `/v1/*` and
+  `/api/*` handlers now poll `request.is_disconnected()` and stop pulling from the
+  upstream engine the moment the client goes away, closing `client.stream()` on a
+  normal control-flow path so the engine aborts generation. Previously a client
+  that disconnected mid-stream left the engine generating to completion against a
+  dead socket (relying on Starlette's cancellation-based disconnect handling,
+  whose upstream close can be interrupted under `CancelledError`) — observed
+  pinning a GPU at 96% for hours with multiple stuck requests. Also covers the
+  swap-wait keepalive loop. Regression test added.
+
 ### Added — v0.3 engine-coverage core (EC1–EC5 + MM4)
 - **Control-call auth headers** — optional `control_headers` on each engine
   config, applied to the control client only (not user traffic). Unblocks

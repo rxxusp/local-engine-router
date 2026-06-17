@@ -188,6 +188,61 @@ async def test_api_chat_streaming_yields_ndjson(mock_upstream):
         assert b"data:" not in joined
 
 
+async def test_streaming_aborts_on_client_disconnect(mock_upstream, monkeypatch):
+    """Regression: a client that disconnects mid-stream must NOT leave the
+    upstream generating to completion against a dead socket.
+
+    This reproduces the orphaned-generation GPU leak: under ASGI>=2.4 Starlette
+    only cancels a streaming generator when send() raises, which it may not for a
+    half-closed client — so the router must poll request.is_disconnected() and
+    stop pulling from upstream. We simulate the disconnect by flipping
+    is_disconnected True after a couple of frames, then assert the stream is cut
+    off early (well before the upstream's full run) and the engine's in-flight
+    slot is released back to zero."""
+    import time
+
+    import starlette.requests
+
+    # The router polls is_disconnected() once per upstream chunk (and during the
+    # swap wait). Report "connected" for the first few polls so a *running* stream
+    # is interrupted, then "disconnected".
+    calls = {"n": 0}
+
+    async def fake_is_disconnected(self):
+        calls["n"] += 1
+        return calls["n"] > 3
+
+    monkeypatch.setattr(
+        starlette.requests.Request, "is_disconnected", fake_is_disconnected
+    )
+
+    N = 200  # upstream would emit 200 frames (~1s) if drained to completion
+    frames = 0
+    started = time.monotonic()
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, mgr):
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4-flash",
+                "stream": True,
+                "messages": [],
+                "_test_stream_n": N,
+            },
+        ) as resp:
+            assert resp.status_code == 200
+            async for chunk in resp.aiter_bytes():
+                frames += chunk.count(b'"i":')
+        elapsed = time.monotonic() - started
+
+        # Cut off after a few frames — not drained to all N...
+        assert 0 < frames < N, f"expected an early abort, got {frames} frames"
+        # ...and quickly, not after the full ~1s upstream stream...
+        assert elapsed < 0.5, f"stream took {elapsed:.2f}s — upstream wasn't aborted"
+        # ...with the engine's in-flight slot released (no leaked generation).
+        assert all(v == 0 for v in mgr._inflight.values()), mgr._inflight
+
+
 async def test_missing_model_field_is_400(mock_upstream):
     async with _client_for(_app_config(mock_upstream.base_url)) as (client, _):
         r = await client.post("/v1/chat/completions", json={"messages": []})
