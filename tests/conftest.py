@@ -254,6 +254,20 @@ def _build_mock_app():
     async def chat(request: Request):
         body = await request.json()
         if body.get("stream"):
+            # A test can request a long, slow stream (``_test_stream_n`` frames,
+            # one every ~5ms) to stand in for a long generation that a client may
+            # disconnect from mid-flight. Each frame is uniquely numbered so the
+            # test can count how many actually reached the client.
+            n = int(body.get("_test_stream_n", 0))
+            if n:
+                async def gen():
+                    for i in range(n):
+                        yield b'data: {"i":' + str(i).encode() + b'}\n\n'
+                        await asyncio.sleep(0.005)
+                    yield b"data: [DONE]\n\n"
+
+                return StreamingResponse(gen(), media_type="text/event-stream")
+
             async def gen():
                 yield b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
                 yield b"data: [DONE]\n\n"
