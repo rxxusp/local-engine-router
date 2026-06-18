@@ -23,7 +23,7 @@ than the one currently holding the GPU, the router performs a full swap before
 forwarding the request:
 
 ```
-  client request (model: qwen3.6-uncensored:27b)
+  client request (model: llama3.1:8b)
         │
         ▼
   resolve model → engine: ollama
@@ -285,7 +285,7 @@ uses `ready_path: /v1/models` + `ready_check: "model:<id>"` to work around it).
 ```
   OpenCode / curl / any OpenAI client
         │
-        │  POST /v1/chat/completions (model: "qwen3.6-uncensored:27b")
+        │  POST /v1/chat/completions (model: "llama3.1:8b")
         ▼
   ┌──────────────────────────────────────┐
   │        local-engine-router :8077     │
@@ -386,8 +386,8 @@ request body so the upstream always sees the real id.
 
 ```yaml
 aliases:
-  gpt-4o-mini: qwen3.6-uncensored:27b
-  claude-3-5-sonnet: deepseek-v4-flash
+  gpt-4o-mini: qwen2.5-7b-instruct
+  claude-3-5-sonnet: llama3.1:8b
 ```
 
 

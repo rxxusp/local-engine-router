@@ -20,9 +20,9 @@ breaking the container.
 4. **Disable** the direct Ollama connection (toggle it off or delete it).
    This is important: if the direct Ollama connection remains enabled, models
    will appear twice in the picker (once from Ollama, once from the router), and
-   direct requests to Ollama bypass the router — preventing automatic engine swaps.
+   direct requests to Ollama bypass the router, preventing automatic engine swaps.
 5. Verify: open the model picker and confirm you see the router's model list
-   (deepseek-v4-flash, qwen3.6-uncensored:27b, etc.).
+   (your configured model ids, e.g. qwen2.5-7b-instruct, llama3.1:8b).
 
 **RAG / embeddings are unaffected.** Embeddings run inside the container via
 `sentence-transformers` (the `USE_EMBEDDING_MODEL_DOCKER` env var) and do not
