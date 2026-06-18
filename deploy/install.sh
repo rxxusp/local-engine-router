@@ -105,9 +105,8 @@ from inside Docker containers, e.g. Open WebUI).
 routerctl usage:
   routerctl status           — show active engine, in-flight counts
   routerctl models           — list all known models
-  routerctl ds4              — swap to ds4 engine now
-  routerctl ollama           — swap to ollama engine now
-  routerctl use deepseek-v4-flash   — swap to whatever engine owns that model
+  routerctl use <engine>     — swap to a specific engine now (e.g. llamacpp)
+  routerctl use <model-id>   — swap to whatever engine owns that model
   routerctl logs             — tail the service log (journalctl --user)
   routerctl restart          — restart the router service
 
