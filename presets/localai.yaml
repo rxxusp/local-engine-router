@@ -1,0 +1,54 @@
+# LocalAI preset for local-engine-router
+# ========================================
+# Engine type: generic_process
+# LocalAI is a self-contained binary (or Docker image) that the router launches
+# as a child process and kills on swap-away.  It exposes an OpenAI-compatible
+# API.  LocalAI manages its own model loading internally but is controlled by
+# starting/stopping the process.
+#
+# Gotcha: LocalAI loads models on first request (JIT), so the router considers
+# it ready as soon as /v1/models returns 200.  Preloading a specific model at
+# startup requires the --preload-models flag or placing a YAML model config in
+# the models directory.  Use ready_check="model:<id>" if you need to confirm a
+# model is preloaded before the router considers the engine active.
+#
+# Alternative: if you run LocalAI as a long-lived service (not router-managed),
+# use type: api_swap instead and omit start_cmd.
+
+engines:
+  localai:
+    type: generic_process
+    enabled: true
+    base_url: http://127.0.0.1:8080
+    start_cmd:
+      - <PATH_TO_LOCALAI>           # e.g. /usr/local/bin/local-ai or ./local-ai
+      - --models-path
+      - <PATH_TO_MODELS_DIR>        # e.g. /models/localai
+      - --address
+      - "127.0.0.1:8080"
+      # Optional flags:
+      # - --threads
+      # - "8"
+      # - --context-size
+      # - "8192"
+      # - --preload-models
+      # - /models/localai/mymodel.yaml  # preload a specific model on startup
+    env: {}
+    # env:
+    #   CUDA_VISIBLE_DEVICES: "0"
+    # cwd: /opt/localai
+    ready_path: /v1/models          # returns 200 when LocalAI is accepting requests
+    ready_check: ""                 # set to "model:<id>" if you preload and need confirmation
+    start_timeout_s: 300
+    stop_signal: SIGTERM
+    stop_timeout_s: 30
+    process_pattern: local-ai
+    log_file: ./logs/localai.log
+    # control_headers:
+    #   Authorization: "Bearer <LOCALAI_API_KEY>"  # if API key auth is configured
+
+models:
+  - id: <MODEL_ID>                  # must match what LocalAI reports in /v1/models data[].id
+    engine: localai
+    display_name: <DISPLAY_NAME>
+    context_length: 8192

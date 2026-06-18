@@ -1,0 +1,51 @@
+# llama.cpp (llama-server) preset for local-engine-router
+# =========================================================
+# Engine type: generic_process
+# The router launches llama-server as a child process and kills it on swap-away.
+# llama-server has a confirmed SIGTERM-freeze bug in some builds; the router
+# escalates to SIGKILL after stop_timeout_s if SIGTERM does not work.
+#
+# Usage: paste the engines: block into your config.yaml, then reference the
+# engine key in the models: list.  Adjust <ANGLE_BRACKET> placeholders.
+#
+# Gotcha: llama-server blocks the whole binary on a single model; to serve a
+# different model the router kills and restarts the process.  Load times depend
+# entirely on model size and whether the weights land in the OS page cache.
+
+engines:
+  llamacpp:
+    type: generic_process
+    enabled: true
+    base_url: http://127.0.0.1:8080
+    start_cmd:
+      - <PATH_TO_LLAMA_SERVER>      # e.g. /usr/local/bin/llama-server
+      - -m
+      - <PATH_TO_MODEL_GGUF>        # e.g. /models/qwen2.5-7b-instruct-q4_k_m.gguf
+      - --port
+      - "8080"
+      - --host
+      - "127.0.0.1"
+      - -ngl                        # number of GPU layers; remove for CPU-only
+      - "99"
+      # Optional extra flags:
+      # - -c
+      # - "8192"                    # context length
+      # - --log-disable             # quieter logs
+    env: {}                         # extra env merged over os.environ, e.g.:
+    # env:
+    #   CUDA_VISIBLE_DEVICES: "0"
+    # cwd: /opt/llama.cpp           # working directory (optional)
+    ready_path: /health             # llama-server returns {"status":"ok"} here
+    ready_check: "status==ok"       # assert the body field; avoids a false-ready
+    start_timeout_s: 300            # large models can take a minute to mmap
+    stop_signal: SIGTERM            # escalates to SIGKILL after stop_timeout_s
+    stop_timeout_s: 30
+    process_pattern: llama-server   # pgrep -f fallback to reap stray workers
+    log_file: ./logs/llamacpp.log
+    # control_headers: {}           # sent on health/ready calls only (not user traffic)
+
+models:
+  - id: <MODEL_ID>                  # must match what clients send; e.g. qwen2.5-7b-instruct
+    engine: llamacpp
+    display_name: <DISPLAY_NAME>    # e.g. Qwen2.5 7B Instruct Q4_K_M
+    context_length: 8192            # must match -c passed to llama-server
