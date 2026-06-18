@@ -598,16 +598,15 @@ class GenericProcessEngine(Engine):
         process_pattern that aren't in our session) are signalled directly as a
         fallback so the group signal never silently misses them.
 
-        On platforms without process groups (Windows), psutil reaps the whole
-        tree instead, so subprocess-managed engines (Ollama, LM Studio,
-        KoboldCpp, llama.cpp) stop cleanly there too."""
+        On platforms without process groups (Windows), psutil signals the whole
+        tree instead (honoring SIGTERM vs SIGKILL), so subprocess-managed engines
+        (Ollama, LM Studio, KoboldCpp, llama.cpp) stop cleanly there too. The
+        signal is sent without waiting -- the async _wait_stopped / _sigkill_
+        leftover loop does the waiting and escalation, so the event loop is never
+        blocked during a swap."""
         if not hasattr(os, "killpg"):
             for pid in pids:
-                sysmem.terminate_process_tree(
-                    pid,
-                    term_timeout=self.cfg.stop_timeout_s,
-                    kill_timeout=10.0,
-                )
+                sysmem.signal_process_tree(pid, kill=(sig == signal.SIGKILL))
             return
         signalled_pgids: set[int] = set()
         for pid in pids:

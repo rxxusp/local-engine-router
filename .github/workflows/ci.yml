@@ -36,3 +36,8 @@ jobs:
 
       - name: Run test suite
         run: python3 -m pytest -q
+
+      - name: Validate backend presets
+        run: |
+          pip install jsonschema
+          python3 presets/validate_presets.py

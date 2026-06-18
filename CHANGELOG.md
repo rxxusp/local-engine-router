@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The project aims to
 follow [Semantic Versioning](https://semver.org/) once it reaches a stable API;
 until then it is in a `0.x` channel where minor versions may break.
 
-## [Unreleased]
+## [0.3.0] - 2026-06-18
 
 ### Fixed
 - **Orphaned upstream generations on client disconnect** — streaming `/v1/*` and
@@ -37,6 +37,29 @@ until then it is in a `0.x` channel where minor versions may break.
 - **Alias / capability routing** — top-level `aliases` map (`{alias → real id}`);
   resolved before routing, with the outgoing request body's `model` rewritten to
   the real id so a client asking for e.g. `gpt-4o-mini` reaches the chosen model.
+
+### Added -- v0.3 public-release polish
+- **Cross-platform memory-settle and process control.** The post-free
+  memory-settle wait and engine teardown now work on Linux, macOS, and Windows
+  via a new `router.sysmem` module: a `/proc/meminfo` fast path on Linux and
+  `psutil` everywhere else, with psutil-based process-tree reaping where process
+  groups are unavailable (Windows). `psutil` is now a runtime dependency.
+- **Backend presets.** Copy-paste `engines:` config fragments under `presets/`
+  for llama.cpp, vLLM, SGLang, KoboldCpp, MLX, MAX, ramalama, LocalAI, TabbyAPI,
+  LM Studio, and Ollama, plus a schema validator and an index.
+- **README centered on the GPU-swap mechanic**, with documented sharp edges
+  (non-streaming requests block for the whole swap, the single-active-engine
+  invariant, and the in-container engine limitation).
+- **Multi-arch Docker** images (`linux/amd64` + `linux/arm64`) and a container
+  `HEALTHCHECK`.
+- **CI matrix** across Python 3.10 / 3.11 / 3.12 and a release-time check that
+  the git tag matches the package version.
+- **Test coverage** for `routerctl` and the proxy header/forwarding utilities.
+
+### Changed
+- The systemd unit and CLI service name are now `local-engine-router` (via a
+  single `SERVICE_NAME` constant), and the unit uses the `%h` specifier so it is
+  no longer tied to one user's home directory.
 
 ## [0.2.0] — 2026-06-02
 Second build-out wave: a generic engine layer, keep-alive on every streaming

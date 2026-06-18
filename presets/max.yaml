@@ -5,9 +5,10 @@
 # launches max serve as a child process and kills it on swap-away.
 #
 # Gotcha: MAX requires the Modular CLI to be installed (`modular install max`).
-# The /health path returns a JSON object with a "status" field; use
-# ready_check="status==ok" to confirm beyond HTTP 200.  First run may
-# download or compile the model; raise start_timeout_s accordingly.
+# `max serve` has no host/bind flag (it binds 0.0.0.0 by default), so do not
+# pass --host.  The OpenAI-compatible readiness endpoint is GET /v1/health
+# (bare 200 when ready).  First run may download or compile the model; raise
+# start_timeout_s accordingly.
 
 engines:
   max:
@@ -22,8 +23,7 @@ engines:
                                     # or a local directory
       - --port
       - "8000"
-      - --host
-      - "127.0.0.1"
+      # Note: `max serve` has no --host flag; it binds 0.0.0.0 by default.
       # Optional flags:
       # - --max-length
       # - "8192"
@@ -32,8 +32,8 @@ engines:
     env: {}
     # env:
     #   MODULAR_HOME: /opt/modular
-    ready_path: /health
-    ready_check: "status==ok"
+    ready_path: /v1/health          # MAX exposes readiness at /v1/health (not /health)
+    ready_check: ""                 # bare 200 = ready (do not assert the body shape)
     start_timeout_s: 600            # first run may download/compile weights
     stop_signal: SIGTERM
     stop_timeout_s: 30

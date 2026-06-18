@@ -19,16 +19,10 @@ terminate_process_tree(pid, term_timeout, kill_timeout)
 
 from __future__ import annotations
 
-import logging
-import os
-import signal
 import sys
-import time
 from typing import Callable
 
 import psutil
-
-log = logging.getLogger("router.sysmem")
 
 # ---------------------------------------------------------------------------
 # Injectable hook — point tests at a fake reader without touching the module.
@@ -84,33 +78,8 @@ def available_bytes() -> int:
 
 
 # ---------------------------------------------------------------------------
-# terminate_process_tree()
+# signal_process_tree()
 # ---------------------------------------------------------------------------
-def _pgid_for(pid: int) -> int | None:
-    """Return the process group id of *pid*, or None if unavailable."""
-    try:
-        return os.getpgid(pid)
-    except (ProcessLookupError, PermissionError, AttributeError, OSError):
-        return None
-
-
-def _send_signal_posix(pid: int, sig: int) -> None:
-    """Send *sig* to the whole process group of *pid* (POSIX fast path),
-    then fall back to signalling *pid* directly if the group fails."""
-    pgid = _pgid_for(pid)
-    if pgid is not None:
-        try:
-            os.killpg(pgid, sig)
-            return
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    # Fallback: signal the process directly (handles strays not in our group).
-    try:
-        os.kill(pid, sig)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-
-
 def _children_of(pid: int) -> list[psutil.Process]:
     """Return all descendants of *pid* via psutil (empty list if not found)."""
     try:
@@ -120,97 +89,25 @@ def _children_of(pid: int) -> list[psutil.Process]:
         return []
 
 
-def _terminate_psutil(pid: int) -> None:
-    """Terminate the whole tree rooted at *pid* via psutil (portable path)."""
-    children = _children_of(pid)
-    # Collect all processes BEFORE terminating so we have the full picture.
-    procs: list[psutil.Process] = []
-    try:
-        procs.append(psutil.Process(pid))
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        pass
-    procs.extend(children)
+def signal_process_tree(pid: int, kill: bool = False) -> None:
+    """Signal the whole process tree rooted at *pid* via psutil, without waiting.
 
-    for p in procs:
-        try:
-            p.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+    This is the portable counterpart to ``os.killpg`` for platforms that have no
+    process groups (Windows). It SIGTERMs (``terminate()``) the root and every
+    descendant, or SIGKILLs (``kill()``) them when *kill* is True.
 
-
-def _kill_survivors(pid: int) -> None:
-    """SIGKILL all remaining live processes in the tree rooted at *pid*."""
-    procs: list[psutil.Process] = []
-    try:
-        procs.append(psutil.Process(pid))
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        pass
-    procs.extend(_children_of(pid))
-
-    for p in procs:
-        if p.is_running():
-            try:
-                p.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-
-
-def _wait_all_gone(pid: int, timeout: float) -> bool:
-    """Return True when all processes in the tree are gone within *timeout*."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        alive = False
-        try:
-            p = psutil.Process(pid)
-            if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
-                alive = True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-        if not alive:
-            # Check children too.
-            children = _children_of(pid)
-            if not children:
-                return True
-            alive = any(
-                c.is_running() and c.status() != psutil.STATUS_ZOMBIE
-                for c in children
-            )
-            if not alive:
-                return True
-        time.sleep(0.05)
-    return False
-
-
-def terminate_process_tree(
-    pid: int,
-    term_timeout: float = 10.0,
-    kill_timeout: float = 5.0,
-) -> None:
-    """Terminate the process tree rooted at *pid*.
-
-    On POSIX systems where the process leads its own session/group (launched
-    with ``start_new_session=True``), ``os.killpg`` is used as the fast path
-    because it reaps forked workers in one call. ``psutil`` is the portable
-    fallback (and the primary path on Windows / when a group is unavailable).
-
-    Steps:
-    1. SIGTERM the whole tree (group signal on POSIX, psutil on others).
-    2. Wait up to *term_timeout* seconds for all processes to exit.
-    3. SIGKILL any survivors; wait up to *kill_timeout* seconds.
+    It does NOT block waiting for exit: callers use their own (async) poll loop
+    to wait and to escalate from terminate to kill, so the event loop is never
+    starved. The process list is captured once up front so children spawned
+    after the snapshot are not chased, and already-gone processes are ignored.
     """
-    if sys.platform != "win32":
-        # POSIX fast path: signal the whole process group.
-        _send_signal_posix(pid, signal.SIGTERM)
-    else:
-        _terminate_psutil(pid)
-
-    if _wait_all_gone(pid, term_timeout):
-        return
-
-    log.warning("terminate_process_tree: pid %s did not exit in %.1fs; SIGKILL", pid, term_timeout)
-    if sys.platform != "win32":
-        _send_signal_posix(pid, signal.SIGKILL)
-    else:
-        _kill_survivors(pid)
-
-    _wait_all_gone(pid, kill_timeout)
+    procs: list[psutil.Process] = _children_of(pid)
+    try:
+        procs.insert(0, psutil.Process(pid))
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    for p in procs:
+        try:
+            p.kill() if kill else p.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass

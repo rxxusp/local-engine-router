@@ -86,25 +86,10 @@ def validate_file(path: pathlib.Path, schema: dict) -> list[str]:
         errors.append("top-level must be a YAML mapping")
         return errors
 
-    # Step 2: field-name cross-check — every key in engines values must be a
-    # known schema field (or additionalProperties: true covers it).
-    engine_schema_props = set()
-    for arm in schema.get("properties", {}).get("engines", {}).get(
-        "additionalProperties", {}
-    ).get("oneOf", []):
-        engine_schema_props.update(arm.get("properties", {}).keys())
-
-    if "engines" in raw:
-        for eng_key, eng_body in (raw["engines"] or {}).items():
-            if not isinstance(eng_body, dict):
-                errors.append(f"engine {eng_key!r}: body must be a mapping")
-                continue
-            for field in eng_body:
-                if field not in engine_schema_props:
-                    # additionalProperties: true means this is just a warning.
-                    pass  # unknown fields are allowed; schema uses additionalProperties
-
-    # Step 3: schema validation (after stripping placeholders).
+    # Step 2: schema validation (after stripping placeholders).
+    # Note: this confirms structural validity against config.schema.json. It
+    # cannot verify that a backend's CLI flags or HTTP endpoints are correct;
+    # those are documented per preset and should be checked against the backend.
     wrapped = _wrap_preset(raw)
     cleaned = _strip_placeholders(wrapped)
     try:
@@ -119,9 +104,7 @@ def validate_file(path: pathlib.Path, schema: dict) -> list[str]:
 
 def main() -> int:
     schema = _load_schema()
-    preset_files = sorted(
-        p for p in PRESETS_DIR.glob("*.yaml") if p.name != "validate_presets.py"
-    )
+    preset_files = sorted(PRESETS_DIR.glob("*.yaml"))
 
     if not preset_files:
         print("No preset YAML files found in", PRESETS_DIR)

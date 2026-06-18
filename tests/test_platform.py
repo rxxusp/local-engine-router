@@ -3,15 +3,16 @@
 Covers:
   * available_bytes() returns a positive int on this host.
   * _await_memory_settle plateau logic against a mocked rising-then-flat curve.
-  * terminate_process_tree escalation with a real short-lived subprocess.
-  * macOS/Windows code paths reachable via monkeypatching sys.platform / psutil.
+  * signal_process_tree terminate/kill against real short-lived subprocesses.
+  * The engine's no-process-group (Windows) teardown branch.
+  * macOS/Windows memory paths reachable via monkeypatching sys.platform / psutil.
   * Injectable _mem_reader hook is honoured.
-  * is_port_listening() basic behaviour.
 """
 
 from __future__ import annotations
 
 import asyncio
+import itertools
 import os
 import signal
 import sys
@@ -129,12 +130,17 @@ async def test_memory_settle_plateau_stops_early():
     # Rising-then-plateau curve: first call returns a high value, then rises
     # a little, then plateaus (< 1 GiB change). We inject via sysmem._mem_reader
     # (available_bytes returns bytes; _read_mem_available_kb divides by 1024).
-    readings_bytes = iter([
-        80 * 1024 ** 3,      # first sample: 80 GiB
-        90 * 1024 ** 3,      # second: rose 10 GiB -> not stable
-        90 * 1024 ** 3 + 1,  # third: rose < 1 GiB -> stable=1
-        90 * 1024 ** 3 + 2,  # fourth: rose < 1 GiB -> stable=2 -> return
-    ])
+    # Rising-then-plateau, with a repeating tail so the loop never exits merely
+    # because the readings ran out (StopIteration); it must exit on the plateau.
+    readings_bytes = itertools.chain(
+        iter([
+            80 * 1024 ** 3,      # first sample: 80 GiB
+            90 * 1024 ** 3,      # second: rose 10 GiB -> not stable
+            90 * 1024 ** 3 + 1,  # third: rose < 1 GiB -> stable=1
+            90 * 1024 ** 3 + 2,  # fourth: rose < 1 GiB -> stable=2 -> return
+        ]),
+        itertools.repeat(90 * 1024 ** 3 + 2),
+    )
 
     saved = sysmem._mem_reader
     sysmem._mem_reader = lambda: next(readings_bytes)
@@ -142,8 +148,8 @@ async def test_memory_settle_plateau_stops_early():
         t0 = asyncio.get_running_loop().time()
         await mgr._await_memory_settle(10.0)
         dt = asyncio.get_running_loop().time() - t0
-        # Should finish well before the 10s timeout (3 sleep(0.5) at most).
-        assert dt < 5.0, f"settle took too long: {dt:.2f}s"
+        # Must finish on the plateau, well before the 10s timeout.
+        assert dt < 5.0, f"settle did not stop early on plateau: {dt:.2f}s"
     finally:
         sysmem._mem_reader = saved
 
@@ -191,11 +197,20 @@ async def test_memory_settle_timeout_fires():
 
 
 # ===========================================================================
-# terminate_process_tree — escalation with a real subprocess
+# signal_process_tree — portable, signal-only teardown (no internal wait)
 # ===========================================================================
-@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
-def test_terminate_process_tree_kills_subprocess():
-    """terminate_process_tree must kill a real subprocess."""
+def _wait_dead(pid: int, timeout: float = 5.0) -> bool:
+    """Poll until *pid* is gone (signal_process_tree does not wait itself)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.02)
+    return not _alive(pid)
+
+
+def test_signal_process_tree_terminates_subprocess():
+    """signal_process_tree() must stop a real subprocess (SIGTERM path)."""
     import subprocess as sp
 
     proc = sp.Popen(
@@ -204,12 +219,9 @@ def test_terminate_process_tree_kills_subprocess():
     )
     pid = proc.pid
     try:
-        sysmem.terminate_process_tree(pid, term_timeout=3.0, kill_timeout=2.0)
-        # Give the OS a moment to reap.
-        time.sleep(0.1)
-        assert not _alive(pid), f"process {pid} still alive after terminate_process_tree"
+        sysmem.signal_process_tree(pid)
+        assert _wait_dead(pid), f"process {pid} still alive after signal_process_tree"
     finally:
-        # Belt-and-suspenders cleanup.
         try:
             proc.kill()
             proc.wait(timeout=2)
@@ -217,33 +229,27 @@ def test_terminate_process_tree_kills_subprocess():
             pass
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
-def test_terminate_process_tree_reaps_child_process():
-    """terminate_process_tree must kill the parent AND its forked child."""
+def test_signal_process_tree_kill_true_force_kills():
+    """kill=True must SIGKILL even a process that ignores SIGTERM."""
     import subprocess as sp
 
-    # Parent forks a long-running child.
+    # Ignore SIGTERM so only SIGKILL (kill=True) can stop it.
     script = (
-        "import os, sys, time, subprocess\n"
-        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
-        "    start_new_session=False)\n"
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "time.sleep(60)\n"
     )
-    proc = sp.Popen(
-        [sys.executable, "-c", script],
-        start_new_session=True,
-    )
-    parent_pid = proc.pid
-    # Wait a moment for the child to be forked.
-    time.sleep(0.3)
-    child_pids = sysmem._children_of(parent_pid)
-
+    proc = sp.Popen([sys.executable, "-c", script], start_new_session=True)
+    pid = proc.pid
+    # Let the interpreter start and install the SIG_IGN handler before signaling,
+    # otherwise SIGTERM can land during startup (default action) and kill it.
+    time.sleep(0.7)
     try:
-        sysmem.terminate_process_tree(parent_pid, term_timeout=3.0, kill_timeout=2.0)
-        time.sleep(0.1)
-        assert not _alive(parent_pid), "parent still alive"
-        for cp in child_pids:
-            assert not _alive(cp.pid), f"child {cp.pid} still alive"
+        sysmem.signal_process_tree(pid, kill=False)  # SIGTERM -> ignored
+        time.sleep(0.3)
+        assert _alive(pid), "process exited on SIGTERM but the script ignores it"
+        sysmem.signal_process_tree(pid, kill=True)   # SIGKILL -> must die
+        assert _wait_dead(pid), f"process {pid} survived kill=True"
     finally:
         try:
             proc.kill()
@@ -252,30 +258,35 @@ def test_terminate_process_tree_reaps_child_process():
             pass
 
 
-def test_terminate_process_tree_macos_path(monkeypatch):
-    """On macOS (sys.platform != 'win32'), the code path does not call os.killpg
-    directly — instead it calls _send_signal_posix (which wraps os.killpg).
-    Simulate the macOS-style invocation by monkeypatching os.killpg away."""
+def test_signal_process_tree_reaps_child_process():
+    """signal_process_tree must signal the parent AND its forked child."""
     import subprocess as sp
 
-    proc = sp.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"],
-        start_new_session=True,
+    script = (
+        "import sys, time, subprocess\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "time.sleep(60)\n"
     )
-    pid = proc.pid
+    proc = sp.Popen([sys.executable, "-c", script], start_new_session=True)
+    parent_pid = proc.pid
 
-    # Redirect to psutil path by making os.killpg raise.
-    original_killpg = os.killpg
-    def _no_killpg(pgid, sig):
-        raise OSError("simulated: no killpg")
-    monkeypatch.setattr(os, "killpg", _no_killpg)
+    # Poll until the child is actually forked, so the child assertion below can
+    # never be vacuous (an empty snapshot would otherwise "pass" trivially).
+    deadline = time.monotonic() + 5.0
+    child_pids: list = []
+    while time.monotonic() < deadline:
+        child_pids = sysmem._children_of(parent_pid)
+        if child_pids:
+            break
+        time.sleep(0.05)
+    assert child_pids, "child process was never observed; test would be vacuous"
 
     try:
-        sysmem.terminate_process_tree(pid, term_timeout=3.0, kill_timeout=2.0)
-        time.sleep(0.1)
-        assert not _alive(pid), f"process {pid} still alive after simulate-macOS terminate"
+        sysmem.signal_process_tree(parent_pid, kill=True)
+        assert _wait_dead(parent_pid), "parent still alive"
+        for cp in child_pids:
+            assert _wait_dead(cp.pid), f"child {cp.pid} still alive"
     finally:
-        monkeypatch.setattr(os, "killpg", original_killpg)
         try:
             proc.kill()
             proc.wait(timeout=2)
@@ -283,10 +294,34 @@ def test_terminate_process_tree_macos_path(monkeypatch):
             pass
 
 
-def test_terminate_process_tree_nonexistent_pid():
-    """terminate_process_tree on a nonexistent pid must not raise."""
-    # PID 999999 is almost certainly not a real process.
-    sysmem.terminate_process_tree(999999, term_timeout=0.1, kill_timeout=0.1)
+def test_signal_process_tree_nonexistent_pid():
+    """signal_process_tree on a nonexistent pid must not raise."""
+    sysmem.signal_process_tree(999999)
+    sysmem.signal_process_tree(999999, kill=True)
+
+
+def test_engine_windows_branch_uses_signal_process_tree(monkeypatch):
+    """On a platform without os.killpg (Windows), GenericProcessEngine._signal_pids
+    routes teardown through sysmem.signal_process_tree, honoring SIGTERM vs SIGKILL,
+    and returns immediately (no blocking wait on the event loop)."""
+    from router.config import GenericProcessConfig
+    from router.engines import GenericProcessEngine
+    import router.engines as engines_mod
+
+    eng = GenericProcessEngine(
+        GenericProcessConfig(base_url="http://127.0.0.1:9", start_cmd=["x"]),
+        key="winproc",
+    )
+    monkeypatch.delattr(os, "killpg", raising=False)  # simulate Windows
+    calls: list = []
+    monkeypatch.setattr(
+        engines_mod.sysmem,
+        "signal_process_tree",
+        lambda pid, kill=False: calls.append((pid, kill)),
+    )
+    eng._signal_pids([4321], signal.SIGTERM)
+    eng._signal_pids([4321], signal.SIGKILL)
+    assert calls == [(4321, False), (4321, True)]
 
 
 # ===========================================================================

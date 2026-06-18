@@ -6,8 +6,10 @@
 #
 # Gotcha: SGLang with torch.compile enabled performs kernel compilation on cold
 # start which can take 10+ minutes on some GPUs.  Raise start_timeout_s to
-# 900+ in that case.  The /health endpoint returns {"status":"ok"} once the
-# model is ready; use ready_check="status==ok" to confirm beyond HTTP 200.
+# 900+ in that case.  SGLang's /health returns a bare HTTP 200 with an EMPTY
+# body when ready (503 while loading), so leave ready_check empty (a 200 is the
+# readiness signal).  Each server serves one model fixed by --model-path; to
+# change models the router stops and restarts the process.
 
 engines:
   sglang:
@@ -39,7 +41,7 @@ engines:
     #   CUDA_VISIBLE_DEVICES: "0"
     #   HF_HOME: /models/hf-cache
     ready_path: /health
-    ready_check: "status==ok"       # SGLang /health returns {"status":"ok"} when ready
+    ready_check: ""                 # SGLang /health is a bare 200 (empty body) when ready
     start_timeout_s: 900            # torch.compile cold start can exceed 10 min
     stop_signal: SIGTERM
     stop_timeout_s: 30
