@@ -1,0 +1,53 @@
+# SGLang (sglang.launch_server) preset for local-engine-router
+# =============================================================
+# Engine type: generic_process
+# The router launches python3 -m sglang.launch_server as a child process and
+# kills it on swap-away.
+#
+# Gotcha: SGLang with torch.compile enabled performs kernel compilation on cold
+# start which can take 10+ minutes on some GPUs.  Raise start_timeout_s to
+# 900+ in that case.  The /health endpoint returns {"status":"ok"} once the
+# model is ready; use ready_check="status==ok" to confirm beyond HTTP 200.
+
+engines:
+  sglang:
+    type: generic_process
+    enabled: true
+    base_url: http://127.0.0.1:30000
+    start_cmd:
+      - python3
+      - -m
+      - sglang.launch_server
+      - --model-path
+      - <HF_MODEL_ID_OR_PATH>       # e.g. Qwen/Qwen2.5-7B-Instruct or /models/qwen2.5
+      - --port
+      - "30000"
+      - --host
+      - "127.0.0.1"
+      # Optional flags (uncomment as needed):
+      # - --tp
+      # - "1"                       # tensor-parallel degree
+      # - --context-length
+      # - "8192"
+      # - --dtype
+      # - "bfloat16"
+      # - --quantization
+      # - "fp8"
+      # - --enable-torch-compile    # much faster inference, but adds minutes to cold start
+    env: {}
+    # env:
+    #   CUDA_VISIBLE_DEVICES: "0"
+    #   HF_HOME: /models/hf-cache
+    ready_path: /health
+    ready_check: "status==ok"       # SGLang /health returns {"status":"ok"} when ready
+    start_timeout_s: 900            # torch.compile cold start can exceed 10 min
+    stop_signal: SIGTERM
+    stop_timeout_s: 30
+    process_pattern: sglang.launch_server
+    log_file: ./logs/sglang.log
+
+models:
+  - id: <MODEL_ID>                  # must match what clients send
+    engine: sglang
+    display_name: <DISPLAY_NAME>
+    context_length: 8192

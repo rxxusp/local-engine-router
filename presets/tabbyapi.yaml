@@ -1,0 +1,44 @@
+# TabbyAPI (ExLlamaV2) preset for local-engine-router
+# =====================================================
+# Engine type: api_swap
+# TabbyAPI manages its own server process; the router does NOT launch it.
+# Start TabbyAPI separately (or via its own systemd unit).  The router
+# controls VRAM by calling TabbyAPI's explicit HTTP load/unload endpoints.
+#
+# Gotcha: TabbyAPI requires an x-admin-key header for its admin/control
+# endpoints (load, unload, model info).  Set control_headers accordingly.
+# User traffic (chat/completions) typically uses a different api_key; that
+# is an upstream concern handled by the client directly.  TabbyAPI's
+# /v1/model endpoint returns a SINGLE loaded-model object (not a list),
+# which the router handles automatically via loaded_name_key="id".
+
+engines:
+  tabbyapi:
+    type: api_swap
+    enabled: true
+    base_url: http://127.0.0.1:5000
+    health_path: /health            # returns {"status":"ok"} if the server is up
+    unload_path: /v1/model/unload   # POST to release the current model from VRAM
+    unload_method: POST
+    unload_body: {}                 # no body required; TabbyAPI unloads the current model
+    load_path: /v1/model/load       # POST to load a model before serving
+    load_method: POST
+    load_body:
+      model_name: "{model}"         # {model} is replaced with the requested model id
+      # draft_model_name: ""        # optional speculative decoding draft model
+    load_timeout_s: 120             # ExLlamaV2 quantized models load in seconds; large
+                                    # unquantized checkpoints may take longer
+    loaded_path: /v1/model          # single-object endpoint listing the loaded model
+    loaded_models_key: ""           # TabbyAPI returns the object directly (no list key)
+    loaded_name_key: id             # the JSON field holding the model id
+    unload_timeout_s: 60
+    # systemd_unit: tabbyapi.service  # best-effort start if TabbyAPI is unreachable
+    tags_cache_ttl_s: 30
+    control_headers:
+      x-admin-key: <TABBYAPI_ADMIN_KEY>  # set to your TabbyAPI admin_key
+
+models:
+  - id: <MODEL_ID>                  # must match what clients send; often the model dir name
+    engine: tabbyapi
+    display_name: <DISPLAY_NAME>
+    context_length: 8192

@@ -1,0 +1,57 @@
+# vLLM (OpenAI-compatible server) preset for local-engine-router
+# ===============================================================
+# Engine type: generic_process
+# The router launches vllm serve as a child process and kills it on swap-away.
+#
+# Gotcha: vLLM's /health returns HTTP 200 with an EMPTY body while the model
+# is still loading; a bare 200 check would signal "ready" too early.  Set
+# ready_path=/v1/models and ready_check="model:<id>" so the router waits until
+# the model is actually servable.  A cold start that compiles CUDA kernels can
+# take several minutes; raise start_timeout_s accordingly.
+
+engines:
+  vllm:
+    type: generic_process
+    enabled: true
+    base_url: http://127.0.0.1:8000
+    start_cmd:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+      - --model
+      - <HF_MODEL_ID_OR_PATH>       # e.g. Qwen/Qwen2.5-7B-Instruct or /models/qwen2.5
+      - --port
+      - "8000"
+      - --host
+      - "127.0.0.1"
+      # Optional flags (uncomment as needed):
+      # - --max-model-len
+      # - "8192"
+      # - --gpu-memory-utilization
+      # - "0.90"
+      # - --dtype
+      # - "bfloat16"
+      # - --quantization
+      # - "fp8"                     # or awq, gptq, etc.
+      # - --tensor-parallel-size
+      # - "1"
+    env: {}
+    # env:
+    #   CUDA_VISIBLE_DEVICES: "0"
+    #   HF_HOME: /models/hf-cache
+    ready_path: /v1/models          # /health is unreliable before model is loaded
+    ready_check: "model:<HF_MODEL_ID_OR_PATH>"  # replace with the exact model id
+                                    # vLLM reports; must match what the server returns
+    start_timeout_s: 600            # kernel compilation on first load can take 5-10 min
+    stop_signal: SIGTERM
+    stop_timeout_s: 30
+    process_pattern: vllm.entrypoints.openai.api_server
+    log_file: ./logs/vllm.log
+    # control_headers:
+    #   Authorization: "Bearer <API_KEY>"  # if --api-key is set on the server
+
+models:
+  - id: <MODEL_ID>                  # must match what clients send; often the HF repo id
+    engine: vllm
+    display_name: <DISPLAY_NAME>
+    context_length: 8192
