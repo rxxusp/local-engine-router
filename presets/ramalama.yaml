@@ -1,0 +1,43 @@
+# ramalama preset for local-engine-router
+# =========================================
+# Engine type: generic_process
+# ramalama wraps llama.cpp with OCI/container tooling but exposes the same
+# llama-server HTTP API.  The router launches it as a child process and kills
+# it on swap-away.  Use `ramalama serve` to expose the OpenAI-compatible API.
+#
+# Gotcha: ramalama may pull model weights from an OCI registry on first use;
+# raise start_timeout_s if network downloads are expected.  The /health path
+# returns {"status":"ok"} once the server is ready (same as llama-server).
+
+engines:
+  ramalama:
+    type: generic_process
+    enabled: true
+    base_url: http://127.0.0.1:8080
+    start_cmd:
+      - ramalama
+      - serve
+      - --port
+      - "8080"
+      - --detach=false              # keep the process in the foreground so we own it
+      - <MODEL_REF>                 # e.g. ollama://qwen2.5:7b or oci://registry/model:tag
+      # Optional flags:
+      # - --gpu
+      # - "cuda"                    # or "metal", "vulkan", "rocm"
+      # - --context-size
+      # - "8192"
+    env: {}
+    # cwd: /opt/ramalama
+    ready_path: /health
+    ready_check: "status==ok"
+    start_timeout_s: 600            # first-run may pull the model from a registry
+    stop_signal: SIGTERM
+    stop_timeout_s: 30
+    process_pattern: ramalama
+    log_file: ./logs/ramalama.log
+
+models:
+  - id: <MODEL_ID>                  # must match what clients send
+    engine: ramalama
+    display_name: <DISPLAY_NAME>
+    context_length: 8192

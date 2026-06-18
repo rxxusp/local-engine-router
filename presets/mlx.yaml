@@ -1,0 +1,44 @@
+# MLX (mlx_lm.server) preset for local-engine-router
+# =====================================================
+# Engine type: generic_process
+# Apple Silicon only.  The router launches mlx_lm.server as a child process
+# and kills it on swap-away.  mlx_lm.server exposes an OpenAI-compatible API.
+#
+# Gotcha: mlx_lm.server is Apple Silicon (ARM/MPS) only; it will not run on
+# CUDA or CPU-only x86 machines.  Weights are stored as MLX .safetensors;
+# pass a HuggingFace repo id or a local directory converted with mlx_lm.convert.
+# The /health path is not supported; use /v1/models and ready_check instead.
+
+engines:
+  mlx:
+    type: generic_process
+    enabled: true
+    base_url: http://127.0.0.1:8080
+    start_cmd:
+      - python3
+      - -m
+      - mlx_lm.server
+      - --model
+      - <HF_REPO_OR_LOCAL_MLX_DIR>  # e.g. mlx-community/Qwen2.5-7B-Instruct-4bit
+      - --port
+      - "8080"
+      - --host
+      - "127.0.0.1"
+      # Optional flags:
+      # - --max-tokens
+      # - "4096"
+    env: {}
+    ready_path: /v1/models
+    ready_check: "model:<HF_REPO_OR_LOCAL_MLX_DIR>"  # replace with the exact id the
+                                    # server returns in the models list
+    start_timeout_s: 180            # first-run downloads weights if not cached
+    stop_signal: SIGTERM
+    stop_timeout_s: 30
+    process_pattern: mlx_lm.server
+    log_file: ./logs/mlx.log
+
+models:
+  - id: <MODEL_ID>                  # must match what clients send
+    engine: mlx
+    display_name: <DISPLAY_NAME>
+    context_length: 4096

@@ -1,0 +1,50 @@
+# LM Studio (local server) preset for local-engine-router
+# =========================================================
+# Engine type: api_swap
+# LM Studio manages its own server process; the router does NOT launch it.
+# Start LM Studio and enable its local server in the GUI first.
+# The router controls VRAM by calling LM Studio's HTTP load/unload endpoints.
+#
+# Gotcha: LM Studio self-manages its memory: it auto-loads the first model it
+# serves and auto-evicts when loading another.  However, to guarantee VRAM is
+# freed before the router starts the next engine, set unload_path so the
+# router explicitly triggers an unload.  LM Studio's loaded-model list uses
+# instance_id (not the display name) as the unload identifier; set
+# loaded_id_key="identifier" to make the router use that field for unloads.
+# The load endpoint accepts the full model path or identifier string.
+
+engines:
+  lmstudio:
+    type: api_swap
+    enabled: true
+    base_url: http://127.0.0.1:1234
+    health_path: /v1/models         # returns the list of loaded models
+    unload_path: /api/v0/models/<MODEL_IDENTIFIER>/unload  # replace <MODEL_IDENTIFIER>
+                                    # with the model identifier LM Studio reports;
+                                    # alternatively use the generic POST form below
+    unload_method: POST
+    # LM Studio v0.3+ supports a generic unload POST; uncomment to use that instead:
+    # unload_path: /api/v0/models/unload
+    # unload_body:
+    #   identifier: "{model}"       # {model} is replaced with the unload id
+    load_path: /api/v0/models/load  # POST to load a model before serving
+    load_method: POST
+    load_body:
+      identifier: "{model}"         # replace with the model identifier LM Studio uses
+    load_timeout_s: 180
+    loaded_path: /api/v0/models     # lists models with state information
+    loaded_models_key: data         # the JSON array key
+    loaded_name_key: id             # display name field (used for routing match)
+    loaded_id_key: identifier       # unload identifier (distinct from display name)
+    loaded_filter: "state==loaded"  # only report truly-loaded models
+    unload_timeout_s: 60
+    tags_cache_ttl_s: 30
+    # control_headers:              # LM Studio does not require auth by default;
+    #   Authorization: "Bearer <LMS_API_KEY>"  # set if you enabled auth in settings
+
+models:
+  - id: <MODEL_ID>                  # must match what clients send (the display name or id
+                                    # LM Studio reports in /v1/models)
+    engine: lmstudio
+    display_name: <DISPLAY_NAME>
+    context_length: 8192
