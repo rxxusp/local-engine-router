@@ -50,8 +50,10 @@ import time
 from typing import Any
 
 import httpx
+import psutil
 
 from . import metrics
+from . import sysmem
 from .config import RouterConfig, build_model_index
 
 log = logging.getLogger("router.engines")
@@ -449,29 +451,55 @@ class GenericProcessEngine(Engine):
         return cmd
 
     def _pids(self) -> list[int]:
-        """Find this engine's pids via the tracked Popen and/or process_pattern."""
+        """Find this engine's pids via the tracked Popen and/or process_pattern.
+
+        On POSIX, ``pgrep -f`` is the fast path. On platforms without pgrep
+        (macOS without Homebrew, Windows), psutil is the portable fallback."""
         pids: list[int] = []
         if self._proc is not None and self._proc.poll() is None:
             pids.append(self._proc.pid)
         pattern = self.cfg.process_pattern
         if pattern:
+            found = self._pgrep_pids(pattern)
+            for pid in found:
+                if pid != os.getpid() and pid not in pids:
+                    pids.append(pid)
+        return pids
+
+    @staticmethod
+    def _pgrep_pids(pattern: str) -> list[int]:
+        """Return pids whose command line matches *pattern*.
+
+        Tries ``pgrep -f`` (POSIX fast path) then falls back to iterating
+        psutil processes (portable: macOS, Windows, or when pgrep is absent)."""
+        # POSIX fast path.
+        try:
+            out = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            pids: list[int] = []
+            for line in out.stdout.split():
+                try:
+                    pids.append(int(line))
+                except ValueError:
+                    continue
+            return pids
+        except (OSError, subprocess.SubprocessError):
+            pass  # pgrep not available — fall through to psutil
+
+        # psutil fallback (macOS, Windows, or constrained environments).
+        pids = []
+        for proc in psutil.process_iter(["pid", "cmdline"]):
             try:
-                out = subprocess.run(
-                    ["pgrep", "-f", pattern],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-            except (OSError, subprocess.SubprocessError):
-                out = None
-            if out is not None:
-                for line in out.stdout.split():
-                    try:
-                        pid = int(line)
-                    except ValueError:
-                        continue
-                    if pid != os.getpid() and pid not in pids:
-                        pids.append(pid)
+                cmdline = proc.info.get("cmdline") or []
+                cmd_str = " ".join(cmdline)
+                if pattern in cmd_str:
+                    pids.append(proc.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
         return pids
 
     def is_running(self) -> bool:
@@ -568,7 +596,19 @@ class GenericProcessEngine(Engine):
         launcher. Process groups are de-duplicated so a shared group is signalled
         once. PIDs whose group can't be resolved (e.g. strays found via
         process_pattern that aren't in our session) are signalled directly as a
-        fallback so the group signal never silently misses them."""
+        fallback so the group signal never silently misses them.
+
+        On platforms without process groups (Windows), psutil reaps the whole
+        tree instead, so subprocess-managed engines (Ollama, LM Studio,
+        KoboldCpp, llama.cpp) stop cleanly there too."""
+        if not hasattr(os, "killpg"):
+            for pid in pids:
+                sysmem.terminate_process_tree(
+                    pid,
+                    term_timeout=self.cfg.stop_timeout_s,
+                    kill_timeout=10.0,
+                )
+            return
         signalled_pgids: set[int] = set()
         for pid in pids:
             try:
@@ -1165,21 +1205,22 @@ class EngineManager:
 
     @staticmethod
     def _read_mem_available_kb() -> int | None:
-        """Return MemAvailable from /proc/meminfo in kB, or None if unreadable."""
+        """Return available memory in kB, or None if unreadable.
+
+        Delegates to ``sysmem.available_bytes()`` so the settle logic works on
+        every OS (Linux /proc/meminfo, macOS, Windows) rather than silently
+        no-oping on non-Linux hosts. The injectable ``sysmem._mem_reader`` hook
+        lets tests simulate any memory curve without touching real files."""
         try:
-            with open("/proc/meminfo") as fh:
-                for line in fh:
-                    if line.startswith("MemAvailable:"):
-                        return int(line.split()[1])
+            return sysmem.available_bytes() // 1024
         except (OSError, ValueError):
             return None
-        return None
 
     async def _await_memory_settle(self, timeout_s: float) -> None:
         """Block until system memory has been reclaimed after freeing an engine.
 
         The freed model's memory is released by the kernel over a couple of
-        seconds; we poll MemAvailable and return as soon as it stops rising
+        seconds; we poll available memory and return as soon as it stops rising
         (two consecutive samples within ~1 GiB), or after *timeout_s*."""
         loop = asyncio.get_running_loop()
         t0 = loop.time()
@@ -1190,7 +1231,7 @@ class EngineManager:
             avail = self._read_mem_available_kb()
             if avail is None:
                 metrics.record_memory_settle(loop.time() - t0)
-                return  # can't read meminfo — don't block the swap
+                return  # can't read memory — don't block the swap
             if prev >= 0 and (avail - prev) < 1_000_000:  # rose < ~1 GiB
                 stable += 1
                 if stable >= 2:
