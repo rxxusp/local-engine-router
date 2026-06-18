@@ -27,7 +27,6 @@ tests/
 
 # Docs & drafts (README.md/LICENSE are re-included by the Dockerfile COPY)
 CHANGELOG.md
-roadmap/
 deploy/
 
 # Internal dev/build scripts

@@ -10,6 +10,8 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+build/
+dist/
 
 # Internal build/research scripts (dev artifacts)
 .build-workflow.js

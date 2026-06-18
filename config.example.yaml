@@ -44,106 +44,76 @@ allow_destructive_ollama_api: false
 swap_memory_settle_timeout_s: 25.0
 
 # --- Engines ---------------------------------------------------------------
-# `ds4` here is an example of a bespoke server managed by a systemctl --user
-# unit. `ollama` is managed by unloading its models (keep_alive:0).
-ds4:
-  enabled: true
-  base_url: http://127.0.0.1:8099
-  control: systemd-user          # or "process" (launch serve_script + SIGTERM)
-  systemd_user_unit: ds4.service
-  process_pattern: ds4/ds4-server
-  health_path: /v1/models
-  start_timeout_s: 240.0
-  stop_timeout_s: 45.0
-  serve_script: /path/to/ds4/serve.sh   # used only when control: process
+# The `engines:` table is the recommended, general form: add any backend with
+# config only (no Python). Each entry is `engine_key -> { type, ... }` where
+# `type` is one of: generic_process, api_swap, ollama (and `ds4`, an advanced
+# escape hatch documented at the bottom of this file). Models below reference
+# these keys via `engine:`. See presets/ for ready-to-edit blocks per backend.
+engines:
+  # A local server the router launches and supervises (llama.cpp/llama-server,
+  # vLLM, SGLang, KoboldCpp, MLX, ...). Required: base_url + start_cmd.
+  llamacpp:
+    type: generic_process
+    enabled: true
+    base_url: http://127.0.0.1:8080
+    start_cmd:                       # argv list (no shell) or a single string
+      - /usr/local/bin/llama-server
+      - -m
+      - /models/qwen2.5-7b-instruct-q4_k_m.gguf
+      - --port
+      - "8080"
+    # env: { CUDA_VISIBLE_DEVICES: "0" }   # extra env (merged over os.environ)
+    # cwd: /opt/llama.cpp                  # working dir (optional)
+    ready_path: /health                    # polled for HTTP 200 until ready
+    start_timeout_s: 300                   # vLLM/SGLang can take minutes
+    stop_signal: SIGTERM                   # whole process GROUP, SIGTERM->SIGKILL + port-close check
+    stop_timeout_s: 30
+    # process_pattern: llama-server        # pgrep -f to reap forked workers/strays
+    # log_file: ./logs/llamacpp.log
+    # ready_check: "status==ok"            # richer than HTTP 200; "key==value" or "model:<id>".
+    #                                      # vLLM: set ready_path=/v1/models + ready_check="model:<id>"
+    #                                      # (vLLM /health is 200 with an EMPTY body before the model serves)
 
-ollama:
-  enabled: true
-  base_url: http://127.0.0.1:11434
-  health_path: /api/tags
-  unload_timeout_s: 60.0
-  systemd_unit: ollama.service
-  tags_cache_ttl_s: 30.0
+  # Ollama, managed by unloading its models (keep_alive:0) on swap-away.
+  ollama:
+    type: ollama
+    enabled: true
+    base_url: http://127.0.0.1:11434
+    health_path: /api/tags
+    unload_timeout_s: 60.0
+    tags_cache_ttl_s: 30.0
+    # systemd_unit: ollama.service         # best-effort start if unreachable
 
-# --- Generic engine table (alternative to the ds4:/ollama: sections above) --
-# OPTIONAL. The two `ds4:`/`ollama:` sections above are the legacy, always-
-# available form. To add *new* engines with config only (no Python), use this
-# top-level `engines:` table instead. IMPORTANT: when `engines:` is present it
-# is the SOLE source of engines and the `ds4:`/`ollama:` sections above are
-# IGNORED — so the block below is commented out by default. Each entry is
-# `engine_key -> { type, ... }`; `type` is one of: ds4, ollama,
-# generic_process, api_swap. Models then reference these keys via `engine:`.
-#
-# engines:
-#   # A local server the router launches + supervises (llama.cpp/llama-server,
-#   # llamafile, vLLM, SGLang, Aphrodite). Required: base_url + start_cmd.
-#   llamacpp:
-#     type: generic_process
-#     enabled: true
-#     base_url: http://127.0.0.1:8080
-#     start_cmd:                       # argv list (no shell) or a single string
-#       - /usr/local/bin/llama-server
-#       - -m
-#       - /models/qwen2.5-7b-instruct-q4_k_m.gguf
-#       - --port
-#       - "8080"
-#     # env: { CUDA_VISIBLE_DEVICES: "0" }   # extra env (merged over os.environ)
-#     # cwd: /opt/llama.cpp                  # working dir (optional)
-#     ready_path: /health                    # polled for HTTP 200 until ready
-#     start_timeout_s: 300                   # vLLM/SGLang can take minutes (SGLang+compile: >=600)
-#     stop_signal: SIGTERM                   # whole process GROUP, SIGTERM->SIGKILL + port-close check
-#     stop_timeout_s: 30
-#     # process_pattern: llama-server        # pgrep -f to reap forked workers/strays
-#     # log_file: ./logs/llamacpp.log
-#     # ready_check: "status==ok"            # richer than HTTP 200; "key==value" or "model:<id>".
-#     #                                      # vLLM: set ready_path=/v1/models + ready_check="model:<id>"
-#     #                                      # (vLLM /health is 200 with an EMPTY body before the model can serve)
-#     # control_headers: { Authorization: "Bearer SECRET" }   # sent on control/health calls only
-#
-#   # An engine whose models load/unload over HTTP (router owns no process),
-#   # e.g. TabbyAPI / LM Studio. Required: base_url. unload_path frees VRAM on swap-away.
-#   tabby:
-#     type: api_swap
-#     enabled: true
-#     base_url: http://127.0.0.1:5000
-#     health_path: /v1/model                 # readiness probe (loads nothing)
-#     unload_path: /v1/model/unload          # called to release the GPU
-#     unload_method: POST
-#     # unload_body: {}                       # {model} in any string is substituted
-#     loaded_path: /v1/model                 # lists loaded models, to confirm unload
-#     loaded_models_key: data                # JSON key holding the list
-#     loaded_name_key: id                    # per-entry key holding the model name
-#     unload_timeout_s: 60
-#     # systemd_unit: tabbyapi.service        # best-effort start if unreachable
-#     tags_cache_ttl_s: 30
-#     # --- explicit-load engines (TabbyAPI, text-generation-webui) ---
-#     # load_path: /v1/model/load            # POSTed on acquire to load the requested model
-#     # load_method: POST
-#     # load_body: { model_name: "{model}" } # {model} substituted with the requested id
-#     # load_timeout_s: 120
-#     # --- secured / multi-instance engines (e.g. TabbyAPI x-admin-key, LM Studio) ---
-#     # control_headers: { x-admin-key: "SECRET" }   # auth on control/load/unload calls only
-#     # loaded_filter: "state==loaded"       # keep only entries that are actually loaded
-#     # loaded_id_key: instance_id           # unload identifier when distinct from the name (LM Studio)
-#
-# models:
-#   - id: qwen2.5-7b-instruct
-#     engine: llamacpp
-#   - id: my-tabby-model
-#     engine: tabby
+  # An engine whose models load/unload over HTTP (the router owns no process),
+  # e.g. TabbyAPI or LM Studio. See presets/tabbyapi.yaml and presets/lmstudio.yaml.
+  # tabby:
+  #   type: api_swap
+  #   enabled: true
+  #   base_url: http://127.0.0.1:5000
+  #   health_path: /v1/model                 # readiness probe (loads nothing)
+  #   unload_path: /v1/model/unload          # called to release the GPU
+  #   unload_method: POST
+  #   loaded_path: /v1/model                 # lists loaded models, to confirm unload
+  #   loaded_models_key: data                # JSON key holding the list
+  #   loaded_name_key: id                    # per-entry key holding the model name
+  #   unload_timeout_s: 60
+  #   # load_path: /v1/model/load            # explicit-load engines (TabbyAPI, etc.)
+  #   # load_method: POST
+  #   # load_body: { model_name: "{model}" } # {model} substituted with the requested id
+  #   # control_headers: { x-admin-key: "SECRET" }   # auth on control/load/unload calls only
 
 # Static model->engine registry. The `id` must match what clients send, and
-# `engine` must name a configured engine (ds4/ollama here, or a key from the
-# `engines:` table above). Unknown ids fall back to a live Ollama tag lookup.
+# `engine` must name a configured engine above. Unknown ids fall back to a live
+# Ollama tag lookup.
 models:
-  - id: deepseek-v4-flash
-    engine: ds4
-    display_name: DeepSeek V4 Flash
-    context_length: 131072
-  - id: qwen3.6-uncensored:27b
+  - id: qwen2.5-7b-instruct
+    engine: llamacpp
+    display_name: Qwen2.5 7B Instruct
+    context_length: 8192
+  - id: llama3.1:8b
     engine: ollama
-    display_name: Qwen3.6 Uncensored 27B
-    context_length: 262144
+    display_name: Llama 3.1 8B
+    context_length: 131072
 
 # Optional alias map: { alias -> real model id }. A request for an alias is
 # routed to the real model AND the outgoing body's "model" is rewritten to the
@@ -151,5 +121,25 @@ models:
 # SDK defaults) reach a local model. An alias must not shadow a real model id
 # and must point at a real id (no alias->alias chains).
 # aliases:
-#   gpt-4o-mini: qwen3.6-uncensored:27b
-#   claude-3-5-sonnet: deepseek-v4-flash
+#   gpt-4o-mini: qwen2.5-7b-instruct
+#   claude-3-5-sonnet: llama3.1:8b
+
+# --- Advanced: the `ds4` escape hatch --------------------------------------
+# `ds4` drives a model through a `systemctl --user` unit (Restart=always)
+# instead of a router-launched process. You almost certainly want
+# `generic_process` or `api_swap` above. It exists for servers the router must
+# manage via systemd. To use it, add an entry like this under `engines:`:
+#   myds4:
+#     type: ds4
+#     enabled: true
+#     base_url: http://127.0.0.1:8099
+#     control: systemd-user        # or "process" (launch serve_script + SIGTERM)
+#     systemd_user_unit: my.service
+#     health_path: /v1/models
+#     start_timeout_s: 240.0
+#     stop_timeout_s: 45.0
+#     # serve_script: /path/to/serve.sh   # used only when control: process
+#
+# (The legacy top-level `ds4:` and `ollama:` sections are still accepted for
+# back-compat, but `engines:` is preferred and, when present, is the sole source
+# of engines.)

@@ -13,13 +13,13 @@ echo "==> local-engine-router install (repo: $REPO_ROOT)"
 
 # 1. Verify Python dependencies -------------------------------------------
 echo "==> checking Python dependencies..."
-if ! python3 -c "import fastapi, uvicorn, httpx, yaml, pydantic" 2>/dev/null; then
+if ! python3 -c "import fastapi, uvicorn, httpx, yaml, psutil" 2>/dev/null; then
     echo "    some deps missing; attempting: python3 -m pip install --user -r requirements.txt"
     if ! python3 -m pip install --user -r requirements.txt; then
         echo "    WARNING: pip install did not fully succeed; proceeding anyway (deps may be present system-wide)"
     fi
     # Re-check after install attempt.
-    if ! python3 -c "import fastapi, uvicorn, httpx, yaml, pydantic" 2>/dev/null; then
+    if ! python3 -c "import fastapi, uvicorn, httpx, yaml, psutil" 2>/dev/null; then
         echo "    WARNING: could not import all required packages after install attempt"
         echo "             The service may fail to start until dependencies are installed."
     fi

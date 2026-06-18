@@ -37,17 +37,16 @@ def _write(tmp_path, text: str) -> str:
 def test_load_real_config_yaml():
     cfg = load_config(str(REAL_CONFIG))
     assert cfg.port == 8077
-    assert cfg.ds4.enabled is True
-    assert cfg.ollama.enabled is True
-    # Every model references a configured engine (load_config validated it).
+    # The shipped example uses the generic engines: table (llama.cpp + Ollama).
     keys = set(cfg.engine_keys())
-    assert {"ds4", "ollama"} <= keys
+    assert {"llamacpp", "ollama"} <= keys
+    # Every model references a configured engine (load_config validated it).
     for m in cfg.models:
         assert m.engine in keys
     # A couple of known ids from the shipped config.
     ids = {m.id for m in cfg.models}
-    assert "deepseek-v4-flash" in ids
-    assert "qwen3.6-uncensored:27b" in ids
+    assert "qwen2.5-7b-instruct" in ids
+    assert "llama3.1:8b" in ids
 
 
 def test_dangling_model_engine_ref_raises(tmp_path):

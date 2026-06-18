@@ -48,7 +48,7 @@ forwarding the request:
       poll MemAvailable until it plateaus (~1 GiB between samples)
       or swap_memory_settle_timeout_s (default 25 s) elapses
         │
-        │   WHY: after a heavy engine (e.g. ~81 GB ds4) stops,
+        │   WHY: after a heavy engine (e.g. an ~81 GB model) stops,
         │   the kernel may not reclaim those pages for several
         │   seconds. If the next model starts while they are still
         │   resident, its pre-flight memory check sees less free
@@ -261,7 +261,7 @@ in the `<ANGLE_BRACKET>` placeholders.
 | MLX (mlx-lm) | [`presets/mlx.yaml`](presets/mlx.yaml) | `generic_process` |
 | TabbyAPI | [`presets/tabbyapi.yaml`](presets/tabbyapi.yaml) | `api_swap` |
 | LM Studio | [`presets/lmstudio.yaml`](presets/lmstudio.yaml) | `api_swap` |
-| LocalAI | [`presets/localai.yaml`](presets/localai.yaml) | `api_swap` |
+| LocalAI | [`presets/localai.yaml`](presets/localai.yaml) | `generic_process` |
 | ramalama | [`presets/ramalama.yaml`](presets/ramalama.yaml) | `generic_process` |
 | MAX (Modular) | [`presets/max.yaml`](presets/max.yaml) | `generic_process` |
 
@@ -302,8 +302,8 @@ uses `ready_path: /v1/models` + `ready_check: "model:<id>"` to work around it).
   └──────────┬───────────────┬──────────┘
              │               │
    ┌─────────▼────┐   ┌──────▼──────────┐
-   │  ds4 :8099   │   │  Ollama :11434   │
-   │  (~81 GB)    │   │  (various sizes) │
+   │llamacpp :8080│   │  Ollama :11434   │
+   │(or vLLM etc) │   │  (various sizes) │
    └──────────────┘   └─────────────────┘
          ← only ONE active at a time →
          (single-GPU unified memory pool)
@@ -346,9 +346,10 @@ python3 -m router --print-schema    # print the JSON Schema
 ### Generic `engines:` table
 
 Use this to add any number of engines with config only -- no Python needed.
-`type` is one of `ds4`, `ollama`, `generic_process`, `api_swap`. When
-`engines:` is present it is the **sole** source of engines (the `ds4:`/`ollama:`
-legacy sections are ignored).
+`type` is one of `generic_process`, `api_swap`, `ollama` (and `ds4`, an advanced
+escape hatch for systemd-managed servers; see `config.example.yaml`). When
+`engines:` is present it is the **sole** source of engines (the legacy top-level
+`ds4:`/`ollama:` sections are ignored).
 
 ```yaml
 engines:
@@ -433,9 +434,8 @@ dependency -- the exposition is hand-rolled.
 ```bash
 routerctl status                    # active engine, in-flight, last swap
 routerctl models                    # list all known models
-routerctl ds4                       # swap to ds4 now
-routerctl ollama                    # swap to ollama now
-routerctl use qwen3.6-uncensored:27b  # swap to whatever engine owns this model
+routerctl use llamacpp              # swap to a specific engine now
+routerctl use qwen2.5-7b-instruct   # or name a model; swaps to its owning engine
 routerctl logs                      # tail the service journal
 routerctl restart                   # restart the service
 ```
@@ -547,4 +547,3 @@ MIT. Attribution to `rxxusp`. See [`LICENSE`](LICENSE).
 
 > The Python package is `router`; the console scripts are `local-engine-router`
 > and `routerctl`; the project/repo is **local-engine-router**.
-> See [`roadmap/ROADMAP.md`](roadmap/ROADMAP.md) for where this is headed.
