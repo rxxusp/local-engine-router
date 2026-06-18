@@ -25,6 +25,9 @@ import urllib.request
 from typing import Any
 
 BASE_URL = os.environ.get("ROUTER_URL", "http://127.0.0.1:8077").rstrip("/")
+# The systemd user unit name — single definition so a future rename stays in
+# one place.
+SERVICE_NAME = "local-engine-router"
 # Repo root when running from a checkout (router/cli.py -> repo/). Defaults
 # derive from it so a checkout needs no env vars; both are overridable.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -199,7 +202,7 @@ def cmd_health(_args: argparse.Namespace) -> None:
 def cmd_logs(_args: argparse.Namespace) -> None:
     # Try journalctl (user unit) first; fall back to tail -f of the log file.
     try:
-        subprocess.run(["journalctl", "--user", "-u", "local-engine-router", "-f"])
+        subprocess.run(["journalctl", "--user", "-u", SERVICE_NAME, "-f"])
     except (OSError, KeyboardInterrupt):
         try:
             subprocess.run(["tail", "-f", LOG_FILE])
@@ -215,7 +218,7 @@ def cmd_service(args: argparse.Namespace) -> None:
     # The router is a *user* unit, so no sudo and the --user flag.
     try:
         subprocess.run(
-            ["systemctl", "--user", action, "local-engine-router.service"],
+            ["systemctl", "--user", action, f"{SERVICE_NAME}.service"],
             check=True,
         )
     except subprocess.CalledProcessError as exc:
@@ -250,7 +253,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("ollama", help="shortcut: swap to ollama engine")
 
     for action in ("start", "stop", "restart"):
-        sub.add_parser(action, help=f"systemctl --user {action} local-engine-router.service")
+        sub.add_parser(action, help=f"systemctl --user {action} {SERVICE_NAME}.service")
 
     return p
 
