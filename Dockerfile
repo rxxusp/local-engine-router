@@ -55,6 +55,12 @@ USER router
 
 EXPOSE 8077
 
+# Liveness probe using Python's built-in urllib so no extra tool (curl/wget) is
+# needed. /health returns {"status":"ok"} and never triggers a swap.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python3 -c \
+        "import urllib.request, sys; r=urllib.request.urlopen('http://localhost:8077/health',timeout=4); sys.exit(0 if r.status==200 else 1)"
+
 # `python -m router` reads $ROUTER_CONFIG (defaults to /app/config.yaml).
 # Provide one, e.g.:
 #   docker run -p 8077:8077 -v $PWD/config.yaml:/app/config.yaml ghcr.io/rxxusp/local-engine-router
