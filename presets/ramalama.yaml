@@ -6,8 +6,10 @@
 # it on swap-away.  Use `ramalama serve` to expose the OpenAI-compatible API.
 #
 # Gotcha: ramalama may pull model weights from an OCI registry on first use;
-# raise start_timeout_s if network downloads are expected.  The /health path
-# returns {"status":"ok"} once the server is ready (same as llama-server).
+# raise start_timeout_s if network downloads are expected.  `serve` runs in the
+# foreground by default (omit -d/--detach so the router owns the process; there
+# is no --detach=false form).  Readiness is a bare HTTP 200 on /health; do not
+# hardcode the body, since the underlying runtime (llama.cpp/vLLM/MLX) varies.
 
 engines:
   ramalama:
@@ -18,8 +20,9 @@ engines:
       - ramalama
       - serve
       - --port
-      - "8080"
-      - --detach=false              # keep the process in the foreground so we own it
+      - "8080"                      # pin the port; omitting it auto-selects 8080-8180
+      - --host
+      - "127.0.0.1"                 # omitting --host binds all interfaces
       - <MODEL_REF>                 # e.g. ollama://qwen2.5:7b or oci://registry/model:tag
       # Optional flags:
       # - --gpu
@@ -29,7 +32,7 @@ engines:
     env: {}
     # cwd: /opt/ramalama
     ready_path: /health
-    ready_check: "status==ok"
+    ready_check: ""                 # bare 200 = ready (body shape varies by runtime)
     start_timeout_s: 600            # first-run may pull the model from a registry
     stop_signal: SIGTERM
     stop_timeout_s: 30

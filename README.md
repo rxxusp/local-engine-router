@@ -163,13 +163,15 @@ The image (`python:3.12-slim`, no CUDA) is published on every `v*` tag. See
 
 | Platform | Router runs | Memory-settle | systemd unit |
 |----------|------------|---------------|--------------|
-| Linux    | yes        | yes (reads `/proc/meminfo`) | yes (`deploy/local-engine-router.service`) |
-| macOS    | yes        | yes (via `psutil`, requires `pip install psutil`) | no |
-| Windows  | yes        | yes (via `psutil`, requires `pip install psutil`) | no |
+| Linux    | yes        | yes (`/proc/meminfo` fast path) | yes (`deploy/local-engine-router.service`) |
+| macOS    | yes        | yes (via `psutil`) | no |
+| Windows  | yes        | yes (via `psutil`) | no |
 
-`psutil` is optional. When present the router uses it for cross-platform memory
-polling; when absent it falls back to `/proc/meminfo` (Linux only). Install it
-with `pip install psutil` on macOS or Windows.
+`psutil` is a required dependency, installed automatically by `pip install .`
+(or `pip install -r requirements.txt`), so the cross-platform memory-settle
+wait and process control work out of the box on Linux, macOS, and Windows. On
+Linux the router reads `/proc/meminfo` directly as a fast path; everywhere else
+it reads available memory through `psutil`.
 
 
 ## What makes this different
@@ -222,12 +224,13 @@ host.
 Run the router on the host directly (pip install / systemd) if you need
 process-control engines.
 
-### Memory-settle reads /proc/meminfo (Linux only without psutil)
+### Memory-settle uses /proc/meminfo on Linux, psutil elsewhere
 
-By default the router reads `/proc/meminfo`. On macOS and Windows, install
-`psutil` or the memory-settle wait is skipped (logged as a warning). A skipped
-wait may cause the incoming model's pre-flight memory check to fail with OOM on
-heavily loaded systems.
+The router reads `/proc/meminfo` directly on Linux as a fast path and falls back
+to `psutil` (a required dependency) on macOS, Windows, and any other host, so the
+memory-settle wait works on every platform. In the rare case memory cannot be
+read at all, the wait is skipped (logged as a warning), which on a heavily loaded
+system can let the incoming model's pre-flight memory check fail with OOM.
 
 
 ## Authentication and binding
@@ -498,8 +501,8 @@ ceiling.
 The outgoing model's memory hasn't been reclaimed yet. The router waits up to
 `swap_memory_settle_timeout_s` (default 25 s). If you still hit this, the model
 genuinely doesn't fit in available memory -- check `free -g` against the model
-size. On macOS or Windows without `psutil`, the wait is skipped and this race is
-more likely; install `psutil`.
+size. If memory cannot be read at all (very unusual, since `psutil` ships as a
+dependency), the wait is skipped and this race is more likely.
 
 ### ds4 won't stop during a swap
 

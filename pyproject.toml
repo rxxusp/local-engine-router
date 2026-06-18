@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "local-engine-router"
 # Kept in sync with router/__init__.__version__ and CHANGELOG.md. 0.x channel.
-version = "0.2.0"
+version = "0.3.0"
 description = "A single-port OpenAI- and Ollama-compatible reverse proxy that swaps the GPU between local LLM engines on demand."
 readme = "README.md"
 requires-python = ">=3.10"

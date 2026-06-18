@@ -42,7 +42,7 @@ jobs:
               print(tomllib.load(f)["project"]["version"])
           EOF
           )"
-          INIT_VER="$(python3 -c "import ast, pathlib; src=pathlib.Path('router/__init__.py').read_text(); [print(n.value) for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id=='__version__' for t in n.targets)]")"
+          INIT_VER="$(python3 -c "import ast, pathlib; src=pathlib.Path('router/__init__.py').read_text(); [print(ast.literal_eval(n.value)) for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id=='__version__' for t in n.targets)]")"
           echo "tag=$TAG  pyproject=$TOML_VER  __version__=$INIT_VER"
           if [ "$TAG" != "$TOML_VER" ]; then
             echo "ERROR: git tag $TAG does not match pyproject.toml version $TOML_VER" >&2

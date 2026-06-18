@@ -301,20 +301,26 @@ class TestCmdUse:
         assert "engine" not in sent_bodies[0]
 
     def test_swap_post_timeout_is_generous(self, monkeypatch):
-        """Swap POST must use a long timeout (>=60s) to wait for cold starts."""
-        timeouts = []
+        """The /admin/swap POST specifically must use a long timeout (>=60s)."""
+        calls = []
 
         def fake_urlopen(req, timeout=None):
-            timeouts.append(timeout)
+            calls.append((req.get_method(), req.full_url, timeout))
             return _FakeResponse(_STATUS_PAYLOAD)
 
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
         args = argparse.Namespace(command="use", target="ds4")
         cli.cmd_use(args)
 
-        # The swap POST is the one with a long timeout (300s in current impl).
-        swap_timeout = max(t for t in timeouts if t is not None)
-        assert swap_timeout >= 60.0
+        # Assert the generous timeout is on the swap POST itself, not just on
+        # some call (a GET status probe may use a short timeout).
+        swap_timeouts = [
+            t for (method, url, t) in calls
+            if method == "POST" and url.endswith("/admin/swap")
+        ]
+        assert swap_timeouts, f"no POST to /admin/swap was made; calls={calls}"
+        assert all(t is not None and t >= 60.0 for t in swap_timeouts), \
+            f"swap POST timeout not generous enough: {swap_timeouts}"
 
     def test_ds4_shortcut_routes_to_use(self, monkeypatch):
         """The 'ds4' shortcut should behave identically to 'use ds4'."""
@@ -564,6 +570,8 @@ class TestMainDispatch:
         monkeypatch.setattr(sys, "argv", ["routerctl", "health"])
         monkeypatch.setattr(urllib.request, "urlopen", _make_urlopen(_HEALTH_PAYLOAD))
         cli.main()
+        # Dispatch must actually print the health payload, not just not-crash.
+        assert "ok" in capsys.readouterr().out.lower()
 
     def test_main_start_calls_systemctl(self, monkeypatch):
         captured = []

@@ -134,8 +134,9 @@ async def forward(
 ) -> tuple[int, dict[str, str], bytes]:
     """Send *method* request to *url* and return (status_code, headers, body).
 
-    Headers are filtered for both the outgoing request and the returned
-    response.  The caller is responsible for error handling.
+    The returned response headers are filtered (hop-by-hop headers stripped).
+    The caller is responsible for filtering the outgoing request *headers*
+    before calling this, and for error handling.
     """
     resp = await client.request(
         method,

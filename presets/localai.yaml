@@ -22,10 +22,13 @@ engines:
     base_url: http://127.0.0.1:8080
     start_cmd:
       - <PATH_TO_LOCALAI>           # e.g. /usr/local/bin/local-ai or ./local-ai
+      - run                         # the 'run' subcommand is required to start the server
       - --models-path
       - <PATH_TO_MODELS_DIR>        # e.g. /models/localai
       - --address
       - "127.0.0.1:8080"
+      # - --single-active-backend     # keep only one model resident (LRU swap) if you let
+      #                               # LocalAI manage multiple models itself
       # Optional flags:
       # - --threads
       # - "8"
@@ -37,8 +40,8 @@ engines:
     # env:
     #   CUDA_VISIBLE_DEVICES: "0"
     # cwd: /opt/localai
-    ready_path: /v1/models          # returns 200 when LocalAI is accepting requests
-    ready_check: ""                 # set to "model:<id>" if you preload and need confirmation
+    ready_path: /readyz             # LocalAI's own healthcheck endpoint; bare 200 = ready
+    ready_check: ""                 # a 200 is the readiness signal (do not assert the body)
     start_timeout_s: 300
     stop_signal: SIGTERM
     stop_timeout_s: 30

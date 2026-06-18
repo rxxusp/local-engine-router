@@ -6,7 +6,10 @@
 # native API; use that base_url for router traffic.
 #
 # Gotcha: KoboldCpp uses its own CLI flags (--model, --gpulayers, --port).
-# The ready endpoint is the native /api/v1/info; confirm with ready_check.
+# Omitting --host binds all interfaces, so pin --host 127.0.0.1 for a local
+# router.  Readiness is a bare HTTP 200 on /api/extra/version (always present,
+# unauthenticated); KoboldCpp has no HTTP load/unload, so the router owns the
+# process and restarts it to change models.
 
 engines:
   koboldcpp:
@@ -30,8 +33,8 @@ engines:
       # - "512"
     env: {}
     # cwd: /opt/koboldcpp
-    ready_path: /api/v1/info        # returns {"result":"KoboldCpp API"} when ready
-    ready_check: "result==KoboldCpp API"
+    ready_path: /api/extra/version  # always-present capabilities endpoint; bare 200 = up
+    ready_check: ""                 # a 200 is the readiness signal (do not assert the body)
     start_timeout_s: 300
     stop_signal: SIGTERM
     stop_timeout_s: 30
