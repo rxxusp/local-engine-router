@@ -33,6 +33,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from router import metrics
+from router import sysmem
 from router.config import ModelSpec, RouterConfig
 from router.engines import APISwapEngine, Engine, EngineManager
 
@@ -52,15 +53,17 @@ def _reset_metrics():
 def _instant_memory_settle(monkeypatch):
     """Make the post-free memory-settle wait instant across the suite.
 
-    EngineManager._await_memory_settle returns immediately when it can't read
-    /proc/meminfo. Forcing _read_mem_available_kb -> None gives every swap an
-    instant, deterministic settle (no real 0.5s polling sleeps), while still
+    _await_memory_settle returns immediately when sysmem.available_bytes()
+    raises OSError (which causes _read_mem_available_kb to return None).
+    Injecting a reader that raises OSError gives every swap an instant,
+    deterministic settle (no real 0.5s polling sleeps), while still
     exercising the settle code path (it records the memory_settle metric). No
     test in this suite asserts on settle *timing*, so this is purely a speedup
     and removes machine-dependent flakiness."""
-    monkeypatch.setattr(
-        EngineManager, "_read_mem_available_kb", staticmethod(lambda: None)
-    )
+    def _raise_os_error():
+        raise OSError("memory unavailable (test hook)")
+
+    monkeypatch.setattr(sysmem, "_mem_reader", _raise_os_error)
 
 
 # --------------------------------------------------------------------------- #

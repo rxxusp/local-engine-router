@@ -1,0 +1,327 @@
+"""MM1 — cross-platform memory and process-control unit tests.
+
+Covers:
+  * available_bytes() returns a positive int on this host.
+  * _await_memory_settle plateau logic against a mocked rising-then-flat curve.
+  * terminate_process_tree escalation with a real short-lived subprocess.
+  * macOS/Windows code paths reachable via monkeypatching sys.platform / psutil.
+  * Injectable _mem_reader hook is honoured.
+  * is_port_listening() basic behaviour.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import signal
+import sys
+import time
+
+import psutil
+import pytest
+
+import router.sysmem as sysmem
+from router.engines import EngineManager
+from router.config import RouterConfig
+
+from conftest import make_config, make_manager_with_fakes, FakeEngine
+
+
+# ===========================================================================
+# available_bytes — basic sanity
+# ===========================================================================
+def test_available_bytes_returns_positive_int():
+    """available_bytes() must return a positive integer on this host."""
+    # The autouse _instant_memory_settle fixture injects a raising reader;
+    # we need to clear it here so we test the real implementation.
+    saved = sysmem._mem_reader
+    sysmem._mem_reader = None
+    try:
+        result = sysmem.available_bytes()
+        assert isinstance(result, int), f"expected int, got {type(result)}"
+        assert result > 0, f"expected positive value, got {result}"
+    finally:
+        sysmem._mem_reader = saved
+
+
+def test_available_bytes_injectable_hook():
+    """The _mem_reader hook overrides the OS path."""
+    saved = sysmem._mem_reader
+    sysmem._mem_reader = lambda: 42_000_000_000
+    try:
+        assert sysmem.available_bytes() == 42_000_000_000
+    finally:
+        sysmem._mem_reader = saved
+
+
+def test_available_bytes_raises_oserror_when_hook_raises():
+    """If the hook raises OSError, available_bytes() propagates it."""
+    saved = sysmem._mem_reader
+    sysmem._mem_reader = lambda: (_ for _ in ()).throw(OSError("nope"))
+    try:
+        with pytest.raises(OSError):
+            sysmem.available_bytes()
+    finally:
+        sysmem._mem_reader = saved
+
+
+def test_available_bytes_macos_path(monkeypatch):
+    """On macOS (sys.platform='darwin'), psutil is used instead of /proc/meminfo."""
+    monkeypatch.setattr(sysmem, "_mem_reader", None)
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    class _FakeVM:
+        available = 8_000_000_000
+
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: _FakeVM())
+    result = sysmem.available_bytes()
+    assert result == 8_000_000_000
+
+
+def test_available_bytes_windows_path(monkeypatch):
+    """On Windows (sys.platform='win32'), psutil is used."""
+    monkeypatch.setattr(sysmem, "_mem_reader", None)
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    class _FakeVM:
+        available = 16_000_000_000
+
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: _FakeVM())
+    result = sysmem.available_bytes()
+    assert result == 16_000_000_000
+
+
+def test_available_bytes_linux_proc_meminfo_fallback_to_psutil(monkeypatch, tmp_path):
+    """On Linux, if /proc/meminfo is unreadable, psutil is the fallback."""
+    monkeypatch.setattr(sysmem, "_mem_reader", None)
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    # Make _linux_available_bytes raise so we fall through to psutil.
+    def _bad_read():
+        raise OSError("simulated /proc unreadable")
+
+    monkeypatch.setattr(sysmem, "_linux_available_bytes", _bad_read)
+
+    class _FakeVM:
+        available = 5_000_000_000
+
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: _FakeVM())
+    result = sysmem.available_bytes()
+    assert result == 5_000_000_000
+
+
+# ===========================================================================
+# _await_memory_settle — plateau logic
+# ===========================================================================
+async def test_memory_settle_plateau_stops_early():
+    """The settle loop must return as soon as two consecutive samples differ by
+    less than 1 GiB, regardless of the timeout."""
+    from router.config import ModelSpec
+
+    # Build a simple two-fake manager so we can call _await_memory_settle.
+    models = [
+        ModelSpec(id="m-a", engine="a", display_name="a"),
+    ]
+    cfg = make_config(models=models, swap_memory_settle_timeout_s=10.0)
+    fakes = {"a": FakeEngine("a")}
+    mgr = make_manager_with_fakes(fakes, cfg=cfg)
+
+    # Rising-then-plateau curve: first call returns a high value, then rises
+    # a little, then plateaus (< 1 GiB change). We inject via sysmem._mem_reader
+    # (available_bytes returns bytes; _read_mem_available_kb divides by 1024).
+    readings_bytes = iter([
+        80 * 1024 ** 3,      # first sample: 80 GiB
+        90 * 1024 ** 3,      # second: rose 10 GiB -> not stable
+        90 * 1024 ** 3 + 1,  # third: rose < 1 GiB -> stable=1
+        90 * 1024 ** 3 + 2,  # fourth: rose < 1 GiB -> stable=2 -> return
+    ])
+
+    saved = sysmem._mem_reader
+    sysmem._mem_reader = lambda: next(readings_bytes)
+    try:
+        t0 = asyncio.get_running_loop().time()
+        await mgr._await_memory_settle(10.0)
+        dt = asyncio.get_running_loop().time() - t0
+        # Should finish well before the 10s timeout (3 sleep(0.5) at most).
+        assert dt < 5.0, f"settle took too long: {dt:.2f}s"
+    finally:
+        sysmem._mem_reader = saved
+
+
+async def test_memory_settle_none_returns_immediately():
+    """When _read_mem_available_kb returns None, the settle returns immediately."""
+    from router.config import ModelSpec
+    models = [ModelSpec(id="m-a", engine="a", display_name="a")]
+    cfg = make_config(models=models, swap_memory_settle_timeout_s=10.0)
+    fakes = {"a": FakeEngine("a")}
+    mgr = make_manager_with_fakes(fakes, cfg=cfg)
+
+    # The autouse fixture already injects a raising hook so this is implicit,
+    # but we verify the timing explicitly.
+    t0 = asyncio.get_running_loop().time()
+    await mgr._await_memory_settle(10.0)
+    dt = asyncio.get_running_loop().time() - t0
+    assert dt < 1.0, f"expected instant return, took {dt:.2f}s"
+
+
+async def test_memory_settle_timeout_fires():
+    """When memory never plateaus, the settle wait exits at timeout_s."""
+    from router.config import ModelSpec
+    models = [ModelSpec(id="m-a", engine="a", display_name="a")]
+    cfg = make_config(models=models, swap_memory_settle_timeout_s=0.3)
+    fakes = {"a": FakeEngine("a")}
+    mgr = make_manager_with_fakes(fakes, cfg=cfg)
+
+    # Always rising by more than 1 GiB per sample.
+    counter = [0]
+    def _always_rising():
+        counter[0] += 1
+        return counter[0] * 2 * 1024 ** 3  # 2 GiB more each time
+
+    saved = sysmem._mem_reader
+    sysmem._mem_reader = _always_rising
+    try:
+        t0 = asyncio.get_running_loop().time()
+        await mgr._await_memory_settle(0.3)
+        dt = asyncio.get_running_loop().time() - t0
+        # Should have waited close to the timeout.
+        assert 0.25 <= dt < 2.0, f"unexpected timeout duration: {dt:.2f}s"
+    finally:
+        sysmem._mem_reader = saved
+
+
+# ===========================================================================
+# terminate_process_tree — escalation with a real subprocess
+# ===========================================================================
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+def test_terminate_process_tree_kills_subprocess():
+    """terminate_process_tree must kill a real subprocess."""
+    import subprocess as sp
+
+    proc = sp.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    pid = proc.pid
+    try:
+        sysmem.terminate_process_tree(pid, term_timeout=3.0, kill_timeout=2.0)
+        # Give the OS a moment to reap.
+        time.sleep(0.1)
+        assert not _alive(pid), f"process {pid} still alive after terminate_process_tree"
+    finally:
+        # Belt-and-suspenders cleanup.
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+def test_terminate_process_tree_reaps_child_process():
+    """terminate_process_tree must kill the parent AND its forked child."""
+    import subprocess as sp
+
+    # Parent forks a long-running child.
+    script = (
+        "import os, sys, time, subprocess\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+        "    start_new_session=False)\n"
+        "time.sleep(60)\n"
+    )
+    proc = sp.Popen(
+        [sys.executable, "-c", script],
+        start_new_session=True,
+    )
+    parent_pid = proc.pid
+    # Wait a moment for the child to be forked.
+    time.sleep(0.3)
+    child_pids = sysmem._children_of(parent_pid)
+
+    try:
+        sysmem.terminate_process_tree(parent_pid, term_timeout=3.0, kill_timeout=2.0)
+        time.sleep(0.1)
+        assert not _alive(parent_pid), "parent still alive"
+        for cp in child_pids:
+            assert not _alive(cp.pid), f"child {cp.pid} still alive"
+    finally:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def test_terminate_process_tree_macos_path(monkeypatch):
+    """On macOS (sys.platform != 'win32'), the code path does not call os.killpg
+    directly — instead it calls _send_signal_posix (which wraps os.killpg).
+    Simulate the macOS-style invocation by monkeypatching os.killpg away."""
+    import subprocess as sp
+
+    proc = sp.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    pid = proc.pid
+
+    # Redirect to psutil path by making os.killpg raise.
+    original_killpg = os.killpg
+    def _no_killpg(pgid, sig):
+        raise OSError("simulated: no killpg")
+    monkeypatch.setattr(os, "killpg", _no_killpg)
+
+    try:
+        sysmem.terminate_process_tree(pid, term_timeout=3.0, kill_timeout=2.0)
+        time.sleep(0.1)
+        assert not _alive(pid), f"process {pid} still alive after simulate-macOS terminate"
+    finally:
+        monkeypatch.setattr(os, "killpg", original_killpg)
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def test_terminate_process_tree_nonexistent_pid():
+    """terminate_process_tree on a nonexistent pid must not raise."""
+    # PID 999999 is almost certainly not a real process.
+    sysmem.terminate_process_tree(999999, term_timeout=0.1, kill_timeout=0.1)
+
+
+# ===========================================================================
+# engines.py integration: _read_mem_available_kb delegates to sysmem
+# ===========================================================================
+def test_engines_read_mem_uses_sysmem_hook(monkeypatch):
+    """EngineManager._read_mem_available_kb must read from sysmem, not /proc."""
+    saved = sysmem._mem_reader
+    sysmem._mem_reader = lambda: 100 * 1024 * 1024 * 1024  # 100 GiB in bytes
+    try:
+        # _read_mem_available_kb returns kB.
+        result = EngineManager._read_mem_available_kb()
+        assert result == 100 * 1024 * 1024  # 100 GiB in kB
+    finally:
+        sysmem._mem_reader = saved
+
+
+def test_engines_read_mem_returns_none_on_oserror(monkeypatch):
+    """_read_mem_available_kb returns None when sysmem.available_bytes raises."""
+    saved = sysmem._mem_reader
+    sysmem._mem_reader = lambda: (_ for _ in ()).throw(OSError("unavailable"))
+    try:
+        result = EngineManager._read_mem_available_kb()
+        assert result is None
+    finally:
+        sysmem._mem_reader = saved
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+def _alive(pid: int) -> bool:
+    """Return True if pid is still a running (non-zombie) process."""
+    try:
+        p = psutil.Process(pid)
+        return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
