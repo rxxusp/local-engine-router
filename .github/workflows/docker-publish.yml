@@ -29,6 +29,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # On tag pushes: assert that the git tag (v1.2.3 -> 1.2.3) matches both
+      # pyproject.toml [project].version and router/__init__.__version__.
+      # Fails the release early if they diverge, before any image is pushed.
+      - name: Assert tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          TOML_VER="$(python3 - <<'EOF'
+          import tomllib, pathlib
+          with open("pyproject.toml", "rb") as f:
+              print(tomllib.load(f)["project"]["version"])
+          EOF
+          )"
+          INIT_VER="$(python3 -c "import ast, pathlib; src=pathlib.Path('router/__init__.py').read_text(); [print(n.value) for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id=='__version__' for t in n.targets)]")"
+          echo "tag=$TAG  pyproject=$TOML_VER  __version__=$INIT_VER"
+          if [ "$TAG" != "$TOML_VER" ]; then
+            echo "ERROR: git tag $TAG does not match pyproject.toml version $TOML_VER" >&2
+            exit 1
+          fi
+          if [ -n "$INIT_VER" ] && [ "$TAG" != "$INIT_VER" ]; then
+            echo "ERROR: git tag $TAG does not match router/__version__ $INIT_VER" >&2
+            exit 1
+          fi
+          echo "Version check passed: $TAG"
+
+      - name: Set up QEMU (for cross-arch builds)
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -60,6 +88,7 @@ jobs:
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
