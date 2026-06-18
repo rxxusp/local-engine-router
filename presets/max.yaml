@@ -1,0 +1,47 @@
+# Modular MAX (max serve) preset for local-engine-router
+# =======================================================
+# Engine type: generic_process
+# Modular MAX (max-serve) exposes an OpenAI-compatible API.  The router
+# launches max serve as a child process and kills it on swap-away.
+#
+# Gotcha: MAX requires the Modular CLI to be installed (`modular install max`).
+# The /health path returns a JSON object with a "status" field; use
+# ready_check="status==ok" to confirm beyond HTTP 200.  First run may
+# download or compile the model; raise start_timeout_s accordingly.
+
+engines:
+  max:
+    type: generic_process
+    enabled: true
+    base_url: http://127.0.0.1:8000
+    start_cmd:
+      - max
+      - serve
+      - --model-path
+      - <HF_MODEL_ID_OR_PATH>       # e.g. modularai/Llama-3.1-8B-Instruct-GGUF
+                                    # or a local directory
+      - --port
+      - "8000"
+      - --host
+      - "127.0.0.1"
+      # Optional flags:
+      # - --max-length
+      # - "8192"
+      # - --quantization-encoding
+      # - "float32"                 # or bfloat16, float16, q4_0, etc.
+    env: {}
+    # env:
+    #   MODULAR_HOME: /opt/modular
+    ready_path: /health
+    ready_check: "status==ok"
+    start_timeout_s: 600            # first run may download/compile weights
+    stop_signal: SIGTERM
+    stop_timeout_s: 30
+    process_pattern: max serve
+    log_file: ./logs/max.log
+
+models:
+  - id: <MODEL_ID>                  # must match what clients send
+    engine: max
+    display_name: <DISPLAY_NAME>
+    context_length: 8192

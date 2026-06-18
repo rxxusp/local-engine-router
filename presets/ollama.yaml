@@ -1,0 +1,32 @@
+# Ollama preset for local-engine-router
+# =======================================
+# Engine type: ollama
+# Ollama manages its own daemon and loads models JIT (on first request).
+# The router does NOT launch Ollama; it must be running before the router starts.
+# On swap-away the router unloads all Ollama models via keep_alive:0 so VRAM
+# is freed before the next engine is started.
+#
+# Gotcha: Ollama is a JIT engine; there is no explicit load path -- a model
+# loads automatically when the first request arrives.  The router uses this
+# type's built-in /api/ps unload mechanism, not api_swap's generic load_path.
+# If you want the router to manage Ollama as part of the engines: table (rather
+# than the legacy `ollama:` section), use the block below.  When `engines:` is
+# present the legacy `ollama:` section is ignored.
+
+engines:
+  ollama:
+    type: ollama
+    enabled: true
+    base_url: http://127.0.0.1:11434
+    health_path: /api/tags          # Ollama native readiness probe (no model load)
+    unload_timeout_s: 60            # wait for running models to unload (free VRAM)
+    systemd_unit: ollama.service    # best-effort start via systemctl if unreachable
+    tags_cache_ttl_s: 30            # cache /api/tags responses for this many seconds
+    # control_headers: {}           # auth on control calls if Ollama is behind a proxy
+
+models:
+  - id: <OLLAMA_MODEL_TAG>          # must match exactly what `ollama list` shows
+                                    # e.g. qwen2.5:7b or llama3.2:latest
+    engine: ollama
+    display_name: <DISPLAY_NAME>
+    context_length: 8192
