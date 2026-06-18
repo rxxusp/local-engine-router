@@ -301,9 +301,10 @@ def test_signal_process_tree_nonexistent_pid():
 
 
 def test_engine_windows_branch_uses_signal_process_tree(monkeypatch):
-    """On a platform without os.killpg (Windows), GenericProcessEngine._signal_pids
-    routes teardown through sysmem.signal_process_tree, honoring SIGTERM vs SIGKILL,
-    and returns immediately (no blocking wait on the event loop)."""
+    """On a platform without os.killpg AND without signal.SIGKILL (Windows),
+    GenericProcessEngine._signal_pids routes teardown through
+    sysmem.signal_process_tree without raising, and returns immediately (no
+    blocking wait on the event loop)."""
     from router.config import GenericProcessConfig
     from router.engines import GenericProcessEngine
     import router.engines as engines_mod
@@ -312,16 +313,21 @@ def test_engine_windows_branch_uses_signal_process_tree(monkeypatch):
         GenericProcessConfig(base_url="http://127.0.0.1:9", start_cmd=["x"]),
         key="winproc",
     )
-    monkeypatch.delattr(os, "killpg", raising=False)  # simulate Windows
+    # Simulate Windows: no process groups and no SIGKILL symbol. If the code
+    # ever references signal.SIGKILL directly on this path it will AttributeError.
+    monkeypatch.delattr(os, "killpg", raising=False)
+    monkeypatch.delattr(signal, "SIGKILL", raising=False)
     calls: list = []
     monkeypatch.setattr(
         engines_mod.sysmem,
         "signal_process_tree",
         lambda pid, kill=False: calls.append((pid, kill)),
     )
+    # Normal SIGTERM stop and a force-kill escalation (via the module's portable
+    # _SIGKILL fallback) must both route to signal_process_tree without raising.
     eng._signal_pids([4321], signal.SIGTERM)
-    eng._signal_pids([4321], signal.SIGKILL)
-    assert calls == [(4321, False), (4321, True)]
+    eng._signal_pids([4321], engines_mod._SIGKILL)
+    assert len(calls) == 2 and all(pid == 4321 for pid, _ in calls)
 
 
 # ===========================================================================

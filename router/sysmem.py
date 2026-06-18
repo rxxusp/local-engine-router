@@ -10,11 +10,11 @@ available_bytes() -> int
     Current MemAvailable (Linux: /proc/meminfo fast path; other: psutil).
     The internal reader is overridable via ``_mem_reader`` for tests.
 
-terminate_process_tree(pid, term_timeout, kill_timeout)
-    SIGTERM the whole process tree rooted at *pid*, wait *term_timeout*,
-    then SIGKILL survivors. On POSIX, where a process group is available,
-    os.killpg is the fast path (reaps forked workers in one call). psutil
-    is the portable fallback (and the primary path on Windows).
+signal_process_tree(pid, kill=False)
+    Signal the whole process tree rooted at *pid* via psutil, without waiting:
+    terminate() the root and every descendant, or kill() them when *kill* is
+    True. The portable counterpart to os.killpg for platforms with no process
+    groups (Windows); callers do their own (async) waiting and escalation.
 """
 
 from __future__ import annotations

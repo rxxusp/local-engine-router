@@ -58,6 +58,13 @@ from .config import RouterConfig, build_model_index
 
 log = logging.getLogger("router.engines")
 
+# SIGKILL is Unix-only. On Windows it is absent from the signal module, and
+# psutil terminate()/kill() (and os.kill) both map to TerminateProcess anyway,
+# so SIGTERM is a safe stand-in for the force-kill signal there. Referencing
+# this constant instead of signal.SIGKILL keeps the teardown paths from raising
+# AttributeError on platforms without process groups.
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
 
 class EngineError(RuntimeError):
     """Raised when an engine cannot be made ready (start/swap failure)."""
@@ -371,7 +378,7 @@ class Ds4Engine(Engine):
         log.warning("ds4: %s still alive after stop; SIGKILL", leftover)
         for pid in leftover:
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, _SIGKILL)
             except ProcessLookupError:
                 pass
         await self._wait_stopped(10.0)
@@ -606,7 +613,7 @@ class GenericProcessEngine(Engine):
         blocked during a swap."""
         if not hasattr(os, "killpg"):
             for pid in pids:
-                sysmem.signal_process_tree(pid, kill=(sig == signal.SIGKILL))
+                sysmem.signal_process_tree(pid, kill=(sig == _SIGKILL))
             return
         signalled_pgids: set[int] = set()
         for pid in pids:
@@ -637,7 +644,7 @@ class GenericProcessEngine(Engine):
             return
         log.warning("%s: %s still alive after %s; SIGKILL",
                     self.key, leftover, self.cfg.stop_signal)
-        self._signal_pids(leftover, signal.SIGKILL)
+        self._signal_pids(leftover, _SIGKILL)
         await self._wait_stopped(10.0)
 
     async def _wait_stopped(self, timeout_s: float) -> bool:

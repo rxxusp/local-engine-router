@@ -39,6 +39,9 @@ The presets use the three lifecycle models the router supports:
 - **`ollama`** a preset of `api_swap` tuned for Ollama's JIT model loading and
   its `/api/ps` and `/api/tags` endpoints.
 
+(There is a fourth type, `ds4`, an advanced escape hatch for systemd-managed
+servers. It is not a normal backend and has no preset; see `config.example.yaml`.)
+
 ## Included backends
 
 | Preset | Engine type | Notes |

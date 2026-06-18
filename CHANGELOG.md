@@ -137,7 +137,7 @@ the new pieces.
   engines it only talks to over HTTP.
 
 ## [0.1.0] — 2026-05-30
-Initial private release.
+Initial release.
 
 ### Added
 - Single-port OpenAI- and Ollama-compatible reverse proxy that swaps the GPU
