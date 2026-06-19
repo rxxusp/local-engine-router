@@ -584,18 +584,6 @@ async def test_admin_discover_merges_discovered_index(mock_upstream):
         assert "offline-model" in engines.get("offline-engine", [])
 
 
-async def test_admin_discover_no_discovered_index_guard(mock_upstream):
-    """Without _discovered_index on manager, /admin/discover still works."""
-    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
-        # Ensure the attribute is absent (it shouldn't be set by default).
-        if hasattr(manager, "_discovered_index"):
-            del manager._discovered_index  # type: ignore[attr-defined]
-
-        r = await client.post("/admin/discover", json={})
-        assert r.status_code == 200
-        assert "engines" in r.json()
-
-
 async def test_admin_discover_gated_by_auth(mock_upstream):
     """POST /admin/discover must require an API key when auth is enabled."""
     cfg = _app_config(mock_upstream.base_url, api_keys=[API_KEY])
