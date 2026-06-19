@@ -81,6 +81,17 @@ class ModelSpec:
     engine: str  # engine key: must match a configured engine
     display_name: str
     context_length: int = 131072
+    # Reasoning/thinking-budget guard for models with thinking ON by default
+    # (e.g. DiffusionGemma served with --reasoning-parser + enable_thinking).
+    # Reasoning tokens count against the request's max_tokens, so a small budget
+    # can be entirely consumed by the thought channel, leaving `content` empty
+    # (finish_reason=length). When set, chat-completion requests routed here whose
+    # max_tokens (or max_completion_tokens) is BELOW this value get
+    # `chat_template_kwargs.enable_thinking=false` injected — unless the client
+    # set enable_thinking itself. Generous/unset budgets keep thinking on (the
+    # quality path). None = feature off. vLLM honors request-level
+    # chat_template_kwargs over the server's --default-chat-template-kwargs.
+    disable_thinking_below_max_tokens: int | None = None
 
 
 @dataclass
@@ -487,12 +498,21 @@ def load_config(path: str) -> RouterConfig:
             raise ConfigError(
                 f"model {m['id']!r} must specify an 'engine'"
             )
+        _thinking_floor = m.get("disable_thinking_below_max_tokens")
+        if _thinking_floor is not None:
+            _thinking_floor = int(_thinking_floor)
+            if _thinking_floor < 1:
+                raise ConfigError(
+                    f"model {m['id']!r}: disable_thinking_below_max_tokens must be "
+                    f">= 1 (got {_thinking_floor}); omit it to disable the guard"
+                )
         models.append(
             ModelSpec(
                 id=m["id"],
                 engine=m["engine"],
                 display_name=m.get("display_name", m["id"]),
                 context_length=int(m.get("context_length", 131072)),
+                disable_thinking_below_max_tokens=_thinking_floor,
             )
         )
 
@@ -711,6 +731,15 @@ def config_json_schema() -> dict[str, Any]:
             "engine": {"type": "string"},
             "display_name": {"type": "string"},
             "context_length": {"type": "integer", "default": 131072},
+            "disable_thinking_below_max_tokens": {
+                "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}],
+                "default": None,
+                "description": (
+                    "Inject chat_template_kwargs.enable_thinking=false on chat "
+                    "requests whose max_tokens is below this, so a small budget "
+                    "isn't eaten by the reasoning channel. null/omitted = off."
+                ),
+            },
         },
         "required": ["id", "engine"],
         "additionalProperties": True,

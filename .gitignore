@@ -1,6 +1,7 @@
 # Runtime / machine-specific (kept local, not published)
 # your live config — copy from config.example.yaml
 config.yaml
+config.yaml.bak-*
 logs/
 state.json
 

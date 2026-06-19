@@ -131,6 +131,54 @@ def _resolve_alias_and_rewrite(
     return real, json.dumps(body).encode()
 
 
+def _apply_thinking_policy(
+    manager: EngineManager, model: str, path: str, body: dict[str, Any], raw_body: bytes
+) -> bytes:
+    """Disable the reasoning/thinking channel on small-budget chat-completion
+    requests for models configured with ``disable_thinking_below_max_tokens``.
+
+    Reasoning tokens count against ``max_tokens``; with thinking on a small
+    budget can be wholly consumed by the thought channel, leaving ``content``
+    empty (finish_reason=length). vLLM honors a per-request
+    ``chat_template_kwargs.enable_thinking`` that overrides the server's
+    ``--default-chat-template-kwargs``, so for sub-threshold budgets we inject
+    ``enable_thinking: false`` — unless the client set it explicitly. A
+    generous or unset budget is left untouched (thinking on = the quality path),
+    and the request bytes are returned unchanged unless the policy actually
+    fires."""
+    spec = manager.index.get(model)
+    threshold = getattr(spec, "disable_thinking_below_max_tokens", None) if spec else None
+    if not threshold:
+        return raw_body
+    # chat_template_kwargs / enable_thinking only apply to chat completions.
+    # /v1/messages (Anthropic) and /v1/responses don't carry this knob, so the
+    # guarantee deliberately does not extend there — leave them untouched.
+    if not path.rstrip("/").endswith("chat/completions"):
+        return raw_body
+    budget = body.get("max_completion_tokens")
+    if budget is None:
+        budget = body.get("max_tokens")
+    # bool is an int subclass — reject it explicitly. Accept int OR float, since
+    # JSON/JS clients may send the budget as 500.0. A non-number means no budget
+    # was set (full context available) → leave thinking on, as does a generous
+    # budget at/above the threshold.
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+        return raw_body
+    if budget >= threshold:
+        return raw_body
+    ctk = body.get("chat_template_kwargs")
+    if isinstance(ctk, dict) and "enable_thinking" in ctk:
+        return raw_body  # client made an explicit choice → respect it
+    ctk = dict(ctk) if isinstance(ctk, dict) else {}
+    ctk["enable_thinking"] = False
+    body["chat_template_kwargs"] = ctk
+    log.info(
+        "thinking policy: %s max_tokens=%s < %s -> enable_thinking=false",
+        model, budget, threshold,
+    )
+    return json.dumps(body).encode()
+
+
 def _find_ollama_engine(manager: EngineManager) -> OllamaEngine | None:
     """Return the first OllamaEngine in the manager's table, or None.
 
@@ -372,6 +420,11 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         # Resolve a capability/alias to the real model id and rewrite the body
         # so the upstream sees the real id (no-op + unchanged bytes if not an alias).
         model, raw_body = _resolve_alias_and_rewrite(manager, model, body, raw_body)
+
+        # Reasoning/thinking-budget guard (e.g. DiffusionGemma): on small-budget
+        # chat requests, turn thinking off so the answer channel isn't starved to
+        # empty. No-op + unchanged bytes for models without the policy configured.
+        raw_body = _apply_thinking_policy(manager, model, path, body, raw_body)
 
         is_stream: bool = bool(body.get("stream", False))
         fwd_headers = _build_fwd_headers(request)
