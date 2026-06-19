@@ -391,6 +391,109 @@ aliases:
 ```
 
 
+## Model auto-discovery
+
+Auto-discovery is **opt-in and off by default.** When `discover.enabled` is
+false (or the `discover:` block is absent entirely), the router is
+byte-identical to a build without the feature. Discovery only activates when
+you set `discover: enabled: true` in `config.yaml`.
+
+### Global discover block
+
+```yaml
+discover:
+  enabled: false            # opt-in; false is the safe default
+  collision: config_order   # how to resolve engine conflicts (only mode today)
+  port_probe:
+    enabled: false          # reserved for future use; parse-validated, not yet active
+```
+
+`collision: config_order` means the first engine in declaration order wins when
+two engines both claim the same model id. A one-time WARNING is logged naming
+both engines.
+
+### Per-engine discovery fields (generic_process only)
+
+On any `generic_process` engine you can set:
+
+```yaml
+engines:
+  llamacpp:
+    type: generic_process
+    start_cmd: ["/usr/local/bin/llama-server", "-m", "/models/my-model.gguf", "--port", "8080"]
+    base_url: http://127.0.0.1:8080
+    ready_path: /health
+    discover_models: true          # opt this engine into discovery
+    served_models:                 # optional extra hint ids (augments start_cmd parse)
+      - my-model
+    tags_cache_ttl_s: 30.0        # TTL for the /v1/models cache used during discovery
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `discover_models` | `false` | Opt this engine into the discovery index. Required for the engine to participate. |
+| `served_models` | `[]` | Extra model ids to register regardless of what the engine advertises live. Useful when the engine is typically stopped. |
+| `tags_cache_ttl_s` | `30.0` | Seconds to cache the `/v1/models` response from this engine when building the discovery index. |
+
+### How discovery augments the static registry
+
+Discovery **augments** the static `models:` list. It never overrides it.
+
+- Static `models:` entries always win. If a model id appears in both the static
+  list and the discovery index, the static entry takes precedence.
+- Newly-pulled Ollama tags and live `api_swap` model ids are picked up
+  automatically without a restart.
+- For a **stopped** `generic_process` engine, the router resolves models from
+  three sources in union: the `start_cmd` argv (parsing `--served-model-name`,
+  `--model`/`-m`, and `.gguf` basenames), a self-healing last-seen cache
+  populated while the engine ran, and the explicit `served_models` hint list.
+  This means a model belonging to a stopped engine still appears in
+  `GET /v1/models` and routes correctly when requested (triggering a start).
+
+The last-seen cache is persisted in `state.json` under `seen_models` and
+reloaded on startup, so discovery survives router restarts.
+
+### Per-model thinking guard
+
+Any model in the static `models:` list can carry a per-model field:
+
+```yaml
+models:
+  - id: qwen3-30b
+    engine: vllm
+    disable_thinking_below_max_tokens: 1000
+```
+
+When `disable_thinking_below_max_tokens` is set on a model, the router
+intercepts `POST /v1/chat/completions` requests for that model and, if the
+request's `max_tokens` is below the threshold AND the client has not explicitly
+set `enable_thinking`, injects `enable_thinking: false` into the request body
+before forwarding. This prevents models from allocating a thinking budget that
+exceeds the available token budget, which can produce empty responses.
+
+If the client already set `enable_thinking` explicitly, the router leaves it
+untouched.
+
+### Triggering a discovery scan
+
+```bash
+# Via HTTP (auth-gated the same as /admin/swap)
+curl -X POST http://127.0.0.1:8077/admin/discover \
+  -H "Authorization: Bearer <key>" \
+  -H "Content-Type: application/json" -d '{}'
+
+# Via routerctl
+routerctl discover
+```
+
+The response is a JSON object mapping each engine key to the sorted list of
+model ids it advertised. Stopped-engine entries from the discovery index (parsed
+from `start_cmd`, last-seen cache, and `served_models`) are merged in.
+
+`POST /admin/discover` is a scan-and-report call. It does not change routing; it
+is intended for inspection and debugging.
+
+
 ## Endpoint reference
 
 | Method | Path | Behaviour |
@@ -399,7 +502,7 @@ aliases:
 | GET | `/health` | `{"status":"ok"}` -- liveness; never triggers a swap |
 | GET | `/metrics` | Prometheus text exposition. Unauthenticated even when `api_keys` are set. |
 | GET | `/status` | Full status: active engine, last swap, per-engine state, model list |
-| GET | `/v1/models` | OpenAI model list: static registry + live Ollama tags, deduplicated. No swap. |
+| GET | `/v1/models` | OpenAI model list: static registry + live engine tags + stopped-engine discovered ids, deduplicated. Discovery entries only appear when `discover.enabled` is true. No swap. |
 | POST | `/v1/chat/completions` | OpenAI chat; routed by `body.model` |
 | POST | `/v1/completions` | OpenAI legacy completions; routed by `body.model` |
 | POST | `/v1/embeddings` | OpenAI embeddings; routed by `body.model` |
@@ -411,6 +514,7 @@ aliases:
 | POST | `/api/embed` | Ollama-native embed; routed by `body.model` |
 | GET/POST | `/api/tags`, `/api/ps`, `/api/version`, `/api/show`, `/api/pull`, `/api/*` | Passthrough to Ollama, no swap. Destructive endpoints refused with 403 unless `allow_destructive_ollama_api: true`. |
 | POST | `/admin/swap` | Body: `{"model":"<id>"}` or `{"engine":"<key>"}`. Proactive swap without a user request. |
+| POST | `/admin/discover` | Scan all engines for discoverable model ids and return a per-engine summary. Auth-gated the same as `/admin/swap`. |
 
 
 ## Metrics
@@ -436,6 +540,7 @@ routerctl status                    # active engine, in-flight, last swap
 routerctl models                    # list all known models
 routerctl use llamacpp              # swap to a specific engine now
 routerctl use qwen2.5-7b-instruct   # or name a model; swaps to its owning engine
+routerctl discover                  # POST /admin/discover: scan engines, print per-engine model ids
 routerctl logs                      # tail the service journal
 routerctl restart                   # restart the service
 ```
