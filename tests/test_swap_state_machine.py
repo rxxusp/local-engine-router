@@ -327,15 +327,15 @@ async def test_seen_models_missing_state_file_is_noop():
     assert mgr._seen_models.get("ds4", set()) == set()
 
 
-async def test_persist_writes_seen_models():
-    """_persist() includes seen_models in the written state."""
+async def test_persist_writes_seen_models_when_discovery_enabled():
+    """_persist() includes seen_models in the written state when discovery is on."""
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
     ) as fh:
         state_path = fh.name
 
     models = [ModelSpec(id="m-ds4", engine="ds4", display_name="d")]
-    cfg = make_config(models=models, state_file=state_path)
+    cfg = make_config(models=models, state_file=state_path, discover=DiscoverConfig(enabled=True))
     fakes = {"ds4": FakeEngine("ds4")}
     mgr = make_manager_with_fakes(fakes, cfg=cfg)
     mgr._seen_models["ds4"] = {"model-alpha", "model-beta"}
@@ -348,11 +348,36 @@ async def test_persist_writes_seen_models():
     assert set(data["seen_models"].get("ds4", [])) == {"model-alpha", "model-beta"}
 
 
+async def test_persist_omits_seen_models_when_discovery_disabled():
+    """_persist() must NOT write the seen_models key when discovery is off.
+
+    This preserves byte-identical state files for configs that do not use
+    the discovery feature."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False
+    ) as fh:
+        state_path = fh.name
+
+    models = [ModelSpec(id="m-ds4", engine="ds4", display_name="d")]
+    # discover.enabled is False by default.
+    cfg = make_config(models=models, state_file=state_path)
+    fakes = {"ds4": FakeEngine("ds4")}
+    mgr = make_manager_with_fakes(fakes, cfg=cfg)
+    mgr._seen_models["ds4"] = {"model-alpha"}
+    mgr._persist()
+
+    with open(state_path) as fh:
+        data = json.load(fh)
+
+    assert "seen_models" not in data
+
+
 async def test_snapshot_seen_models_updates_after_swap():
     """After a successful swap, _seen_models for the target engine is updated.
 
     We give the target FakeEngine an available_models() override that returns
     a known set, then run a swap and give the background task a tick to complete.
+    Discovery must be enabled for the snapshot task to be scheduled.
     """
     class _ModelReturningEngine(FakeEngine):
         async def available_models(self) -> set[str]:
@@ -362,7 +387,7 @@ async def test_snapshot_seen_models_updates_after_swap():
         ModelSpec(id="m-ds4", engine="ds4", display_name="d"),
         ModelSpec(id="m-oll", engine="ollama", display_name="o"),
     ]
-    cfg = make_config(models=models)
+    cfg = make_config(models=models, discover=DiscoverConfig(enabled=True))
     fakes = {
         "ds4": _ModelReturningEngine("ds4"),
         "ollama": FakeEngine("ollama"),
@@ -373,3 +398,33 @@ async def test_snapshot_seen_models_updates_after_swap():
     await asyncio.sleep(0)
     assert "snapped-model-a" in mgr._seen_models.get("ds4", set())
     assert "snapped-model-b" in mgr._seen_models.get("ds4", set())
+
+
+async def test_snapshot_not_scheduled_when_discovery_disabled():
+    """When discover.enabled is False, _snapshot_seen_models is never scheduled
+    after a swap, so _seen_models stays empty even if available_models() returns
+    a non-empty set."""
+    class _ModelReturningEngine(FakeEngine):
+        async def available_models(self) -> set[str]:
+            return {"should-not-appear"}
+
+    models = [
+        ModelSpec(id="m-ds4", engine="ds4", display_name="d"),
+        ModelSpec(id="m-oll", engine="ollama", display_name="o"),
+    ]
+    # Use a fresh temp file so seen_models from prior tests cannot leak in.
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+        state_path = fh.name
+
+    # discover.enabled defaults to False.
+    cfg = make_config(models=models, state_file=state_path)
+    fakes = {
+        "ds4": _ModelReturningEngine("ds4"),
+        "ollama": FakeEngine("ollama"),
+    }
+    mgr = make_manager_with_fakes(fakes, cfg=cfg)
+    await mgr.acquire("m-ds4")
+    # Give the event loop a tick; if a snapshot task were scheduled it would run.
+    await asyncio.sleep(0)
+    # No snapshot scheduled -> _seen_models remains empty for ds4.
+    assert mgr._seen_models.get("ds4", set()) == set()
