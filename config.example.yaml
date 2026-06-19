@@ -140,8 +140,8 @@ models:
 # below; static entries always take precedence. All new behavior is opt-in.
 # discover:
 #   enabled: false           # master switch; discovery is a no-op unless true
-#   augment_only: true       # merge discovered into static list (recommended)
-#   collision: config_order  # config_order (first engine wins) or prefer_up
+#   collision: config_order  # how to handle a model id found on multiple engines
+#                            # (only "config_order" is implemented: first engine wins)
 #   port_probe:
 #     enabled: false         # probe local ports for running backends (future)
 

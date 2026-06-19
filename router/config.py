@@ -284,13 +284,8 @@ class DiscoverConfig:
 
     # Master switch. Discovery is a no-op unless this is true.
     enabled: bool = False
-    # When true (the default), discovered models are merged into the static
-    # registry. When false, the discovered list is used as the sole registry
-    # (advanced; only useful when the static models: list is intentionally empty).
-    augment_only: bool = True
     # How to handle a model id found on multiple engines simultaneously.
     #   "config_order"  -> the engine that appears first in the engines: table wins
-    #   "prefer_up"     -> prefer whichever engine is currently active/up
     collision: str = "config_order"
     # Port probe sub-section (parsed from a nested ``port_probe:`` mapping).
     port_probe_enabled: bool = False
@@ -506,9 +501,9 @@ def _validate_engine_params(key: str, etype: str, params: Any) -> None:
             raise ConfigError(f"engine {key!r} (ollama): missing required 'base_url'")
 
 
-_DISCOVER_VALID_COLLISION: frozenset[str] = frozenset({"config_order", "prefer_up"})
+_DISCOVER_VALID_COLLISION: frozenset[str] = frozenset({"config_order"})
 _DISCOVER_KNOWN_KEYS: frozenset[str] = frozenset(
-    {"enabled", "augment_only", "collision", "port_probe"}
+    {"enabled", "collision", "port_probe"}
 )
 _DISCOVER_PORT_PROBE_KNOWN_KEYS: frozenset[str] = frozenset({"enabled"})
 
@@ -554,7 +549,6 @@ def _parse_discover_section(raw_discover: Any) -> DiscoverConfig:
 
     return DiscoverConfig(
         enabled=bool(raw_discover.get("enabled", False)),
-        augment_only=bool(raw_discover.get("augment_only", True)),
         collision=collision,
         port_probe_enabled=port_probe_enabled,
     )
@@ -565,10 +559,22 @@ def _validate_generic_process_fields(key: str, params: GenericProcessConfig) -> 
 
     Called from _validate_engine_params after the base checks pass.
     """
-    if params.tags_cache_ttl_s < 0:
+    try:
+        ttl = float(params.tags_cache_ttl_s)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"engine {key!r} (generic_process): tags_cache_ttl_s must be a number "
+            f"(got {params.tags_cache_ttl_s!r})"
+        )
+    if ttl < 0:
         raise ConfigError(
             f"engine {key!r} (generic_process): tags_cache_ttl_s must be >= 0 "
             f"(got {params.tags_cache_ttl_s})"
+        )
+    if not isinstance(params.served_models, list):
+        raise ConfigError(
+            f"engine {key!r} (generic_process): served_models must be a list "
+            f"of non-empty strings (got {type(params.served_models).__name__!r})"
         )
     for mid in params.served_models:
         if not isinstance(mid, str) or not mid:
@@ -611,7 +617,13 @@ def load_config(path: str) -> RouterConfig:
             )
         _thinking_floor = m.get("disable_thinking_below_max_tokens")
         if _thinking_floor is not None:
-            _thinking_floor = int(_thinking_floor)
+            try:
+                _thinking_floor = int(_thinking_floor)
+            except (TypeError, ValueError):
+                raise ConfigError(
+                    f"model {m['id']!r}: disable_thinking_below_max_tokens must be "
+                    f"an integer (got {_thinking_floor!r})"
+                )
             if _thinking_floor < 1:
                 raise ConfigError(
                     f"model {m['id']!r}: disable_thinking_below_max_tokens must be "
@@ -868,10 +880,9 @@ def config_json_schema() -> dict[str, Any]:
         ),
         "properties": {
             "enabled": {"type": "boolean", "default": False},
-            "augment_only": {"type": "boolean", "default": True},
             "collision": {
                 "type": "string",
-                "enum": ["config_order", "prefer_up"],
+                "enum": ["config_order"],
                 "default": "config_order",
             },
             "port_probe": {
