@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # On tag pushes: assert that the git tag (v1.2.3 -> 1.2.3) matches both
       # pyproject.toml [project].version and router/__init__.__version__.
@@ -55,7 +55,7 @@ jobs:
           echo "Version check passed: $TAG"
 
       - name: Set up QEMU (for cross-arch builds)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
