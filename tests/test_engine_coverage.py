@@ -33,6 +33,7 @@ from router.config import (
 )
 from router.engines import (
     APISwapEngine,
+    Engine,
     EngineError,
     GenericProcessEngine,
     _ready_check_passes,
@@ -716,3 +717,184 @@ def test_mm4_alias_unknown_target_warns_not_fatal(tmp_path, caplog):
     # Unknown target (could be a live Ollama tag) -> loads, with a warning.
     cfg = load_config(str(p))
     assert cfg.aliases["fast"] == "some-ollama-tag:latest"
+
+
+# =========================================================================== #
+# AM1 — available_models() capability
+# =========================================================================== #
+async def test_am1_base_engine_available_models_returns_empty():
+    """Engine base class available_models() must return an empty set so that
+    subclasses that do not override the method leave existing behavior intact."""
+
+    class _Minimal(Engine):
+        key = "minimal"
+        base_url = "http://x.local"
+
+        async def is_ready(self):
+            return True
+
+        async def ensure_started(self):
+            pass
+
+        async def free_vram(self):
+            pass
+
+    eng = _Minimal()
+    try:
+        result = await eng.available_models()
+    finally:
+        await eng.aclose()
+    assert result == set()
+
+
+async def test_am1_generic_process_running_parses_v1_models():
+    """A running GenericProcessEngine parses the OpenAI /v1/models shape into
+    the correct id set."""
+    cfg = GenericProcessConfig(
+        base_url="http://vllm.local",
+        start_cmd=["/bin/true"],
+        ready_path="/health",
+    )
+    eng = GenericProcessEngine(cfg, key="vllm")
+    rec = _mount(
+        eng,
+        _Recorder(
+            {
+                ("GET", "/health"): httpx.Response(200),
+                ("GET", "/v1/models"): httpx.Response(
+                    200,
+                    json={
+                        "object": "list",
+                        "data": [
+                            {"id": "model-a", "object": "model"},
+                            {"id": "model-b", "object": "model"},
+                        ],
+                    },
+                ),
+            }
+        ),
+    )
+    try:
+        result = await eng.available_models()
+    finally:
+        await eng.aclose()
+    assert result == {"model-a", "model-b"}
+    # The is_ready probe and the model list were both issued.
+    assert rec.calls_to("GET", "/health")
+    assert rec.calls_to("GET", "/v1/models")
+
+
+async def test_am1_generic_process_not_ready_returns_empty():
+    """A not-ready GenericProcessEngine must return empty without hitting the
+    model list endpoint at all."""
+    cfg = GenericProcessConfig(
+        base_url="http://vllm.local",
+        start_cmd=["/bin/true"],
+        ready_path="/health",
+    )
+    eng = GenericProcessEngine(cfg, key="vllm")
+    rec = _mount(
+        eng,
+        _Recorder(
+            {
+                # Health endpoint returns non-200 -> engine is not ready.
+                ("GET", "/health"): httpx.Response(503),
+            }
+        ),
+    )
+    try:
+        result = await eng.available_models()
+    finally:
+        await eng.aclose()
+    assert result == set()
+    # /v1/models must NOT have been called.
+    assert rec.calls_to("GET", "/v1/models") == []
+
+
+async def test_am1_generic_process_http_error_returns_empty():
+    """An HTTP error on /v1/models returns empty (best-effort; never raises)."""
+    cfg = GenericProcessConfig(
+        base_url="http://vllm.local",
+        start_cmd=["/bin/true"],
+        ready_path="/health",
+    )
+    eng = GenericProcessEngine(cfg, key="vllm")
+    _mount(
+        eng,
+        _Recorder(
+            {
+                ("GET", "/health"): httpx.Response(200),
+                ("GET", "/v1/models"): httpx.Response(500, json={"error": "boom"}),
+            }
+        ),
+    )
+    try:
+        result = await eng.available_models()
+    finally:
+        await eng.aclose()
+    assert result == set()
+
+
+async def test_am1_generic_process_ttl_cache_returns_cached_within_window():
+    """Within the TTL window the cached set is returned without a second HTTP
+    call to /v1/models."""
+    cfg = GenericProcessConfig(
+        base_url="http://vllm.local",
+        start_cmd=["/bin/true"],
+        ready_path="/health",
+    )
+    eng = GenericProcessEngine(cfg, key="vllm")
+    rec = _mount(
+        eng,
+        _Recorder(
+            {
+                ("GET", "/health"): httpx.Response(200),
+                ("GET", "/v1/models"): httpx.Response(
+                    200,
+                    json={"object": "list", "data": [{"id": "cached-model"}]},
+                ),
+            }
+        ),
+    )
+    try:
+        first = await eng.available_models()
+        second = await eng.available_models()
+    finally:
+        await eng.aclose()
+    assert first == {"cached-model"}
+    assert second == {"cached-model"}
+    # /v1/models was only called once despite two available_models() calls.
+    assert len(rec.calls_to("GET", "/v1/models")) == 1
+
+
+async def test_am1_generic_process_ttl_cache_refetches_after_expiry():
+    """After the TTL expires a fresh probe is issued."""
+    cfg = GenericProcessConfig(
+        base_url="http://vllm.local",
+        start_cmd=["/bin/true"],
+        ready_path="/health",
+    )
+    eng = GenericProcessEngine(cfg, key="vllm")
+    rec = _mount(
+        eng,
+        _Recorder(
+            {
+                ("GET", "/health"): httpx.Response(200),
+                ("GET", "/v1/models"): httpx.Response(
+                    200,
+                    json={"object": "list", "data": [{"id": "stale-model"}]},
+                ),
+            }
+        ),
+    )
+    try:
+        await eng.available_models()
+        # Expire the cache by back-dating its timestamp.
+        assert eng._models_cache is not None
+        ts, ids = eng._models_cache
+        eng._models_cache = (ts - 999.0, ids)
+        await eng.available_models()
+    finally:
+        await eng.aclose()
+    # Two fetches must have gone to /v1/models (initial + post-expiry).
+    assert len(rec.calls_to("GET", "/v1/models")) == 2
