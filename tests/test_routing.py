@@ -268,6 +268,56 @@ def test_served_ids_from_start_cmd_no_relevant_flags():
 
 
 # --------------------------------------------------------------------------- #
+# New parser tests: '='-joined flags, python-module guard, .GGUF case, empty id
+# --------------------------------------------------------------------------- #
+def test_served_ids_equals_model_flag():
+    """--model=<value> (equals-joined) must be parsed correctly."""
+    ids = served_ids_from_start_cmd(["vllm", "serve", "--model=/models/my-model"])
+    assert "/models/my-model" in ids
+
+
+def test_served_ids_equals_served_model_name_single():
+    """--served-model-name=<value> (equals-joined) yields exactly that one name."""
+    ids = served_ids_from_start_cmd(
+        ["vllm", "serve", "--served-model-name=chat-alias", "--port", "8080"]
+    )
+    assert "chat-alias" in ids
+    # The equals form takes only the one value; '--port' must not be included.
+    assert "8080" not in ids
+    assert "--port" not in ids
+
+
+def test_served_ids_equals_dash_m():
+    """-m=<value> (equals-joined) is parsed as a model flag."""
+    ids = served_ids_from_start_cmd(["/bin/llama-server", "-m=/models/q4.gguf"])
+    assert "/models/q4.gguf" in ids
+    assert "q4" in ids
+
+
+def test_served_ids_python_module_skipped():
+    """'python3 -m sglang.launch_server --model-path /m/x' must not produce
+    'sglang.launch_server' as a model id; --model-path /m/x must be discovered."""
+    ids = served_ids_from_start_cmd(
+        ["python3", "-m", "sglang.launch_server", "--model-path", "/m/x"]
+    )
+    assert "sglang.launch_server" not in ids
+    assert "/m/x" in ids
+
+
+def test_served_ids_uppercase_gguf():
+    """Uppercase and mixed-case .GGUF extensions must also produce a basename id."""
+    ids = served_ids_from_start_cmd(["/bin/llama-server", "-m", "/models/MyModel.GGUF"])
+    assert "/models/MyModel.GGUF" in ids
+    assert "MyModel" in ids
+
+
+def test_served_ids_bare_gguf_no_empty_id():
+    """A value that is exactly '.gguf' (after basename) must not add an empty id."""
+    ids = served_ids_from_start_cmd(["/bin/llama-server", "-m", ".gguf"])
+    assert "" not in ids
+
+
+# --------------------------------------------------------------------------- #
 # Local fake engine with a cfg that has discover_models
 # --------------------------------------------------------------------------- #
 class _FakeDiscoverEngine(FakeEngine):

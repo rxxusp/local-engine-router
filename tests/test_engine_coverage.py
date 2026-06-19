@@ -898,3 +898,62 @@ async def test_am1_generic_process_ttl_cache_refetches_after_expiry():
         await eng.aclose()
     # Two fetches must have gone to /v1/models (initial + post-expiry).
     assert len(rec.calls_to("GET", "/v1/models")) == 2
+
+
+async def test_am1_generic_process_not_ready_result_is_cached():
+    """A not-ready result must be cached so the engine is probed at most once
+    per TTL rather than on every call when it is down."""
+    cfg = GenericProcessConfig(
+        base_url="http://vllm.local",
+        start_cmd=["/bin/true"],
+        ready_path="/health",
+    )
+    eng = GenericProcessEngine(cfg, key="vllm")
+    rec = _mount(
+        eng,
+        _Recorder(
+            {
+                # Engine is not ready.
+                ("GET", "/health"): httpx.Response(503),
+            }
+        ),
+    )
+    try:
+        first = await eng.available_models()
+        second = await eng.available_models()
+    finally:
+        await eng.aclose()
+    assert first == set()
+    assert second == set()
+    # The health probe must have been issued only once; the second call hit the
+    # cache and never called is_ready() again.
+    assert len(rec.calls_to("GET", "/health")) == 1
+
+
+async def test_am1_generic_process_http_error_result_is_cached():
+    """An HTTP error on /v1/models must cache the empty result so a broken
+    engine is probed at most once per TTL."""
+    cfg = GenericProcessConfig(
+        base_url="http://vllm.local",
+        start_cmd=["/bin/true"],
+        ready_path="/health",
+    )
+    eng = GenericProcessEngine(cfg, key="vllm")
+    rec = _mount(
+        eng,
+        _Recorder(
+            {
+                ("GET", "/health"): httpx.Response(200),
+                ("GET", "/v1/models"): httpx.Response(500, json={"error": "oops"}),
+            }
+        ),
+    )
+    try:
+        first = await eng.available_models()
+        second = await eng.available_models()
+    finally:
+        await eng.aclose()
+    assert first == set()
+    assert second == set()
+    # /v1/models was only queried once despite two available_models() calls.
+    assert len(rec.calls_to("GET", "/v1/models")) == 1
