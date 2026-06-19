@@ -325,44 +325,70 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 }
             )
 
-        # Live tags from every engine — best-effort, one try/except per engine
-        # so a single slow or broken engine cannot fail the whole listing.
-        for engine_key, engine in manager.engines.items():
-            try:
-                tags = await engine.available_models()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("could not fetch models from engine %r for /v1/models: %s",
-                            engine_key, exc)
-                continue
-            for tag in sorted(tags):
-                if tag not in seen:
-                    seen.add(tag)
+        if cfg.discover.enabled:
+            # Discovery ON: query every engine's available_models() union and
+            # surface any stopped-engine ids from the discovery index.
+            # Best-effort: one try/except per engine so a single slow or broken
+            # engine cannot fail the whole listing.
+            for engine_key, engine in manager.engines.items():
+                try:
+                    tags = await engine.available_models()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("could not fetch models from engine %r for /v1/models: %s",
+                                engine_key, exc)
+                    continue
+                for tag in sorted(tags):
+                    if tag not in seen:
+                        seen.add(tag)
+                        data.append(
+                            {
+                                "id": tag,
+                                "object": "model",
+                                "created": _MODELS_CREATED_TS,
+                                "owned_by": engine_key,
+                                "name": tag,
+                            }
+                        )
+
+            # Surface any stopped-engine discovered ids (start_cmd parse,
+            # last-seen cache, or served_models) so a down engine's models
+            # still appear here.
+            disc = manager._discovered_index()
+            for model_id, engine_key in disc.items():
+                if model_id not in seen:
+                    seen.add(model_id)
                     data.append(
                         {
-                            "id": tag,
+                            "id": model_id,
                             "object": "model",
                             "created": _MODELS_CREATED_TS,
                             "owned_by": engine_key,
-                            "name": tag,
+                            "name": model_id,
                         }
                     )
-
-        # Surface any stopped-engine discovered ids (start_cmd parse, last-seen
-        # cache, or served_models) so a down engine's models still appear here.
-        # _discovered_index() returns {} when discovery is disabled.
-        disc = manager._discovered_index()
-        for model_id, engine_key in disc.items():
-            if model_id not in seen:
-                seen.add(model_id)
-                data.append(
-                    {
-                        "id": model_id,
-                        "object": "model",
-                        "created": _MODELS_CREATED_TS,
-                        "owned_by": engine_key,
-                        "name": model_id,
-                    }
-                )
+        else:
+            # Discovery OFF: restore the exact pre-discovery behavior.
+            # Only the first OllamaEngine's live tags are unioned in; no other
+            # engine is queried. This keeps /v1/models byte-identical to the
+            # behavior before the auto-discovery feature was added.
+            ollama_engine = _find_ollama_engine(manager)
+            if ollama_engine is not None:
+                try:
+                    tags = await ollama_engine.available_tags()
+                    for tag in sorted(tags):
+                        if tag not in seen:
+                            seen.add(tag)
+                            data.append(
+                                {
+                                    "id": tag,
+                                    "object": "model",
+                                    "created": _MODELS_CREATED_TS,
+                                    "owned_by": ollama_engine.key,
+                                    "name": tag,
+                                }
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("could not fetch ollama tags for /v1/models: %s", exc)
 
         return JSONResponse({"object": "list", "data": data})
 

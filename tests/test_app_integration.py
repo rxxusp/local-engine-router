@@ -23,7 +23,7 @@ import httpx
 
 from router import metrics
 from router.app import create_app
-from router.config import Ds4Config, ModelSpec, OllamaConfig, RouterConfig
+from router.config import Ds4Config, DiscoverConfig, ModelSpec, OllamaConfig, RouterConfig
 import router.cli as cli
 
 
@@ -33,6 +33,8 @@ def _app_config(mock_base: str, *, api_keys=None, aliases=None) -> RouterConfig:
     The legacy ds4:/ollama: sections build a Ds4Engine + OllamaEngine; keeping
     the ollama key as an OllamaEngine is what makes /v1/models tag enrichment
     and the /api/* passthrough work (the app resolves Ollama by type).
+    Discovery is OFF by default (the invariant: discover.enabled=False is
+    byte-identical to origin/main behavior).
     """
     return RouterConfig(
         host="127.0.0.1",
@@ -50,6 +52,18 @@ def _app_config(mock_base: str, *, api_keys=None, aliases=None) -> RouterConfig:
             ModelSpec(id="qwen2.5:3b", engine="ollama", display_name="Qwen 3B"),
         ],
     )
+
+
+def _app_config_discover_on(mock_base: str, *, api_keys=None, aliases=None) -> RouterConfig:
+    """Like _app_config but with discover.enabled=True.
+
+    Used by tests that verify the discovery-on code path (all-engine
+    available_models() union + _discovered_index merge).
+    """
+    cfg = _app_config(mock_base, api_keys=api_keys, aliases=aliases)
+    # RouterConfig is a plain dataclass (not frozen), so field assignment works.
+    cfg.discover = DiscoverConfig(enabled=True)
+    return cfg
 
 
 @contextlib.asynccontextmanager
@@ -411,6 +425,60 @@ async def test_non_destructive_catchall_still_passes_through(mock_upstream):
 
 
 # --------------------------------------------------------------------------- #
+# Backward-compat: discover.enabled=False must NOT call available_models() on
+# non-Ollama engines and must match the static+Ollama-only shape.
+# --------------------------------------------------------------------------- #
+
+async def test_v1_models_discover_off_does_not_call_non_ollama_available_models(mock_upstream):
+    """With discover.enabled=False, /v1/models must not call available_models() on
+    non-Ollama engines and must match the static config + Ollama-tags-only shape.
+
+    This guards the hard invariant: when discovery is off the router behaves
+    byte-identically to origin/main (static models + single OllamaEngine
+    available_tags(); no other engine is queried).
+    """
+    calls: list[str] = []
+
+    class _SpyEngine:
+        """Records calls to available_models() so the test can assert it was not called."""
+
+        def __init__(self, key: str) -> None:
+            self.key = key
+            self.base_url = f"http://spy-{key}.local"
+
+        async def available_models(self) -> set[str]:
+            calls.append(self.key)
+            return {f"spy-model-from-{self.key}"}
+
+        async def aclose(self) -> None:
+            pass
+
+    # discover.enabled defaults to False in _app_config.
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+        # Inject a non-Ollama spy alongside the real engines.
+        manager.engines["spy"] = _SpyEngine("spy")
+        manager._inflight["spy"] = 0
+
+        r = await client.get("/v1/models")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["object"] == "list"
+        ids = {m["id"] for m in data["data"]}
+
+        # Static config entries must be present.
+        assert "deepseek-v4-flash" in ids
+        assert "qwen2.5:3b" in ids
+        # Live Ollama tag from the mock /api/tags must be present.
+        assert "mock-ollama:latest" in ids
+        # The spy engine's model must NOT appear (discover is off).
+        assert "spy-model-from-spy" not in ids
+        # available_models() must NOT have been called on the non-Ollama spy.
+        assert "spy" not in calls, (
+            "available_models() was called on a non-Ollama engine with discover.enabled=False"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Slice 4: /v1/models union from multiple engines' available_models()
 # --------------------------------------------------------------------------- #
 
@@ -436,8 +504,8 @@ class _FakeDiscoverEngine:
 
 
 async def test_v1_models_unions_multiple_engines(mock_upstream):
-    """GET /v1/models: static models first, then all engines' available_models()."""
-    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+    """GET /v1/models with discover ON: static models first, then all engines' available_models()."""
+    async with _client_for(_app_config_discover_on(mock_upstream.base_url)) as (client, manager):
         # Inject two fake engines alongside the real ones.
         manager.engines["fake-a"] = _FakeDiscoverEngine("fake-a", {"model-a1", "model-a2"})
         manager.engines["fake-b"] = _FakeDiscoverEngine("fake-b", {"model-b1"})
@@ -466,8 +534,8 @@ async def test_v1_models_unions_multiple_engines(mock_upstream):
 
 
 async def test_v1_models_deduplicates_across_engines(mock_upstream):
-    """An id present in static config is NOT duplicated by an engine returning it."""
-    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+    """An id present in static config is NOT duplicated by an engine returning it (discover ON)."""
+    async with _client_for(_app_config_discover_on(mock_upstream.base_url)) as (client, manager):
         # Return "deepseek-v4-flash" (already in static config) from a fake engine.
         manager.engines["fake-dup"] = _FakeDiscoverEngine(
             "fake-dup", {"deepseek-v4-flash", "extra-model"}
@@ -484,7 +552,7 @@ async def test_v1_models_deduplicates_across_engines(mock_upstream):
 
 
 async def test_v1_models_best_effort_skips_broken_engine(mock_upstream):
-    """A single broken engine must not prevent the rest from being listed."""
+    """A single broken engine must not prevent the rest from being listed (discover ON)."""
 
     class _BrokenEngine:
         key = "broken"
@@ -496,7 +564,7 @@ async def test_v1_models_best_effort_skips_broken_engine(mock_upstream):
         async def aclose(self) -> None:
             pass
 
-    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+    async with _client_for(_app_config_discover_on(mock_upstream.base_url)) as (client, manager):
         manager.engines["broken"] = _BrokenEngine()
         manager.engines["good"] = _FakeDiscoverEngine("good", {"good-model"})
         manager._inflight["broken"] = 0
@@ -510,8 +578,8 @@ async def test_v1_models_best_effort_skips_broken_engine(mock_upstream):
 
 
 async def test_v1_models_discovered_index_surfaced_when_present(mock_upstream):
-    """When manager has _discovered_index(), its stopped-engine models appear."""
-    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+    """When discover ON and manager has _discovered_index(), its stopped-engine models appear."""
+    async with _client_for(_app_config_discover_on(mock_upstream.base_url)) as (client, manager):
         # Simulate the routing slice providing _discovered_index.
         manager._discovered_index = lambda: {"stopped-model": "some-engine"}
 
