@@ -17,21 +17,42 @@ causes OOM failures.
 
 ## Install
 
-Pick whichever path fits. All three leave the same `local-engine-router` and
-`routerctl` commands on your `PATH`. The router needs Python >= 3.10 and no GPU.
+The fastest way in is `pip install local-engine-router`. All paths below leave
+the same `local-engine-router` and `routerctl` commands on your `PATH`. The
+router needs Python >= 3.10 and no GPU.
 
-### Option 1: one-line script (recommended)
+### Option 1: pip / pipx (recommended)
+
+```bash
+pip install local-engine-router
+```
+
+For an isolated install (recommended for a command-line tool), use
+[pipx](https://pipx.pypa.io):
+
+```bash
+pipx install local-engine-router
+```
+
+That is it: you now have the `local-engine-router` and `routerctl` commands. To
+track the latest `main` instead of the released version:
+
+```bash
+pip install "git+https://github.com/rxxusp/local-engine-router.git"
+```
+
+### Option 2: one-line script (sets up a systemd service for you)
+
+Want a virtualenv plus a managed systemd `--user` service in one shot?
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rxxusp/local-engine-router/main/install.sh | bash
 ```
 
-This creates an isolated virtualenv, installs the package and its dependencies
-into it, links `local-engine-router` and `routerctl` into `~/.local/bin`, writes
-a starter config if you do not have one, and offers to install and enable the
-systemd `--user` service. It is idempotent, so re-run it any time to upgrade.
-
-Pass flags through the pipe with `-s --`:
+This creates an isolated virtualenv, installs the package, links the commands
+into `~/.local/bin`, writes a starter config if you do not have one, and offers
+to install and enable the systemd `--user` service. It is idempotent, so re-run
+it any time to upgrade. Pass flags through the pipe with `-s --`:
 
 ```bash
 curl -fsSL .../install.sh | bash -s -- --yes         # non-interactive; enable the service
@@ -41,20 +62,6 @@ curl -fsSL .../install.sh | bash -s -- --no-service  # skip systemd
 The installer is parameterised by environment variables (`LER_VENV`,
 `LER_CONFIG`, `LER_BIN`, `LER_UNIT_DIR`) and supports `--dry-run`,
 `--print-unit`, and `--uninstall`. Run `install.sh --help` for the full list.
-
-### Option 2: pip / pipx
-
-```bash
-# Once published to PyPI:
-pipx install local-engine-router        # isolated, recommended
-pip install local-engine-router         # into the current environment
-
-# Until then (or to track main), install straight from GitHub:
-pipx install "git+https://github.com/rxxusp/local-engine-router.git"
-```
-
-The package installs both console scripts, `local-engine-router` and
-`routerctl`.
 
 ### Option 3: Docker
 
@@ -77,34 +84,30 @@ The image is pure Python (no CUDA) and is published for `linux/amd64` and
 note that only `api_swap` and `ollama` engines work from a container (see
 [Container limitation](#container-limitation)).
 
-> **Maintainers:** the PyPI path goes live once a PyPI Trusted Publisher is
-> configured and the `ENABLE_PYPI_PUBLISH` repository variable is set to `true`.
-> See [`.github/workflows/pypi-publish.yml`](.github/workflows/pypi-publish.yml)
-> for the exact one-time setup.
-
 
 ## Quickstart
 
 From zero to a running router in three steps:
 
 ```bash
-# 1. Install (any path above). For example:
-curl -fsSL https://raw.githubusercontent.com/rxxusp/local-engine-router/main/install.sh | bash
+# 1. Install
+pip install local-engine-router
 
-# 2. Detect your running engines and write them into the config the service reads.
-#    The installer prints this path as `conf:`; for the one-line install it is:
-local-engine-router init --config ~/.config/local-engine-router/config.yaml
+# 2. Detect your running engines and scaffold a config (writes ./config.yaml)
+local-engine-router init
 
-# 3. Restart so the router picks up the new config, then list its models:
-routerctl restart
+# 3. Start the router (foreground; Ctrl-C to stop)
+local-engine-router --config config.yaml
+
+# ...then from another shell, list the models it now serves:
 curl http://127.0.0.1:8077/v1/models
 ```
 
-> Point `init` at the config the router actually loads. A script install reads
-> `~/.config/local-engine-router/config.yaml` (the `conf:` path the installer
-> prints). A pip/manual install has no service, so run `init` with no `--config`
-> (it writes `./config.yaml`) and start the router directly with
-> `local-engine-router --config ./config.yaml`.
+> Where does the config live? `init` with no `--config` writes `./config.yaml`
+> in the current directory, which is exactly what `local-engine-router --config
+> config.yaml` reads. If instead you used the one-line script (Option 2), it set
+> up a systemd service that reads `~/.config/local-engine-router/config.yaml`, so
+> point `init` at that path and run `routerctl restart` to apply it.
 
 ### The `init` wizard
 
@@ -254,8 +257,8 @@ entire swap. See [Sharp edges](#sharp-edges).
 | macOS    | yes        | yes (via `psutil`) | no |
 | Windows  | yes        | yes (via `psutil`) | no |
 
-`psutil` is a required dependency, installed automatically by `pip install .`
-(or `pip install -r requirements.txt`), so the cross-platform memory-settle
+`psutil` is a required dependency, installed automatically with the package
+(`pip install local-engine-router`), so the cross-platform memory-settle
 wait and process control work out of the box on Linux, macOS, and Windows. On
 Linux the router reads `/proc/meminfo` directly as a fast path; everywhere else
 it reads available memory through `psutil`.
