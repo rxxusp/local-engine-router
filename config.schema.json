@@ -328,6 +328,20 @@
               "control_headers": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "discover_models": {
+                "type": "boolean",
+                "default": false
+              },
+              "served_models": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "tags_cache_ttl_s": {
+                "type": "number",
+                "default": 30.0
               }
             },
             "additionalProperties": true,
@@ -459,6 +473,19 @@
           "context_length": {
             "type": "integer",
             "default": 131072
+          },
+          "disable_thinking_below_max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Inject chat_template_kwargs.enable_thinking=false on chat requests whose max_tokens is below this, so a small budget isn't eaten by the reasoning channel. null/omitted = off."
           }
         },
         "required": [
@@ -467,6 +494,39 @@
         ],
         "additionalProperties": true
       }
+    },
+    "discover": {
+      "type": "object",
+      "description": "Optional global model-discovery settings. Absent or omitted = all defaults (discovery off). Discovery augments the static models: list and is entirely opt-in per engine via discover_models: true.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "augment_only": {
+          "type": "boolean",
+          "default": true
+        },
+        "collision": {
+          "type": "string",
+          "enum": [
+            "config_order",
+            "prefer_up"
+          ],
+          "default": "config_order"
+        },
+        "port_probe": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": true
