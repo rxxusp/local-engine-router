@@ -65,6 +65,64 @@ log = logging.getLogger("router.engines")
 # AttributeError on platforms without process groups.
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
+# Tracked across the process lifetime so each collision pair only warns once.
+_warned_collision: set[tuple[str, str]] = set()
+
+
+def served_ids_from_start_cmd(start_cmd: list[str] | str) -> set[str]:
+    """Extract the set of model ids a GenericProcessEngine command will serve.
+
+    Accepts a list argv or a shell string (split with shlex, same as _launch).
+    Scans for:
+      --served-model-name  <value> ... (collect ALL values until next '-' flag;
+                            vLLM/SGLang allow multiple, so all are ids)
+      -m / --model / --model-path  <first value only>
+
+    Additionally, if any value ends with .gguf, the basename without the
+    extension is added as a second id (so a llama.cpp -m path/to/my-model.gguf
+    advertises both the path and ``my-model`` as valid request ids).
+
+    Returns an empty set if nothing is found. Deterministic, no side effects.
+    """
+    if isinstance(start_cmd, str):
+        try:
+            argv = shlex.split(start_cmd)
+        except ValueError:
+            argv = start_cmd.split()
+    else:
+        argv = list(start_cmd or [])
+
+    ids: set[str] = set()
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+
+        if tok == "--served-model-name":
+            # Collect all following values that are not flags.
+            i += 1
+            while i < len(argv) and not argv[i].startswith("-"):
+                val = argv[i]
+                if val:
+                    ids.add(val)
+                    if val.endswith(".gguf"):
+                        ids.add(os.path.basename(val)[: -len(".gguf")])
+                i += 1
+            continue
+
+        if tok in ("-m", "--model", "--model-path"):
+            if i + 1 < len(argv):
+                val = argv[i + 1]
+                if val and not val.startswith("-"):
+                    ids.add(val)
+                    if val.endswith(".gguf"):
+                        ids.add(os.path.basename(val)[: -len(".gguf")])
+            i += 2
+            continue
+
+        i += 1
+
+    return ids
+
 
 class EngineError(RuntimeError):
     """Raised when an engine cannot be made ready (start/swap failure)."""
@@ -1090,6 +1148,100 @@ class EngineManager:
         self._inflight_cond = asyncio.Condition()
         self._inflight: dict[str, int] = {k: 0 for k in self.engines}
         self._last_swap: dict[str, Any] = {}
+        # Remembered model ids per engine key, persisted across restarts.
+        # Seeded from the state file (if it has a seen_models section) so
+        # down-engine discovery can route to engines we have seen before.
+        self._seen_models: dict[str, set[str]] = {k: set() for k in self.engines}
+        self._load_seen_models_from_state()
+
+    # -- discovery helpers ---------------------------------------------- #
+    def _load_seen_models_from_state(self) -> None:
+        """Seed _seen_models from the persisted state file (best-effort).
+
+        The state file is not authoritative for liveness (startup() re-probes
+        reality), but a previously-observed model list is a good hint for
+        down-engine discovery.  Ignores any IO or parse errors."""
+        try:
+            with open(self.cfg.state_file) as fh:
+                data = json.load(fh)
+            raw = data.get("seen_models") or {}
+            for key, ids in raw.items():
+                if key in self._seen_models and isinstance(ids, list):
+                    self._seen_models[key] = set(str(i) for i in ids if i)
+        except (OSError, ValueError, AttributeError):
+            pass  # missing file, bad JSON, wrong types — all fine
+
+    async def _snapshot_seen_models(self, engine: Engine) -> None:
+        """Update _seen_models[engine.key] with available_models() (best-effort).
+
+        Called after an engine becomes the active one.  Never raises: if the
+        query fails or returns nothing the existing set is left unchanged."""
+        try:
+            ids = await engine.available_models()
+        except Exception:  # noqa: BLE001
+            return
+        if ids:
+            self._seen_models.setdefault(engine.key, set()).update(ids)
+            self._persist()
+
+    def _discovered_index(self) -> dict[str, str]:
+        """Return {model_id -> engine_key} for discovery-enabled engines.
+
+        Only consulted when cfg.discover.enabled is True.  For each engine
+        whose config has discover_models=True (generic_process only for now),
+        the candidate ids are the union of:
+          1. served_ids_from_start_cmd(cfg.start_cmd)  -- from the argv
+          2. _seen_models.get(key, set())               -- from past uptime
+          3. set(getattr(cfg, 'served_models', []))     -- explicit hint list
+
+        When more than one engine claims the same model id, the first engine in
+        cfg.engines order wins (collision='config_order', the only mode for
+        now) and a one-time WARNING is logged naming both engines."""
+        if not self.cfg.discover.enabled:
+            return {}
+
+        result: dict[str, str] = {}  # model_id -> winning engine_key
+
+        # Walk engines in cfg.engines declaration order so the first entry in
+        # the config beats later ones (config_order collision policy).
+        if self.cfg.engines:
+            ordered_keys = [s.key for s in self.cfg.engines if s.enabled]
+        else:
+            ordered_keys = list(self.engines.keys())
+
+        for key in ordered_keys:
+            engine = self.engines.get(key)
+            if engine is None:
+                continue
+            # Only engines whose params.discover_models is True participate.
+            cfg = getattr(engine, "cfg", None)
+            if cfg is None:
+                continue
+            if not getattr(cfg, "discover_models", False):
+                continue
+
+            start_cmd = getattr(cfg, "start_cmd", None) or []
+            cmd_ids = served_ids_from_start_cmd(start_cmd)
+            seen_ids = self._seen_models.get(key, set())
+            explicit_ids = set(getattr(cfg, "served_models", None) or [])
+            candidates = cmd_ids | seen_ids | explicit_ids
+
+            for mid in candidates:
+                if mid in result:
+                    winner = result[mid]
+                    if winner != key:
+                        pair = (winner, key)
+                        if pair not in _warned_collision:
+                            _warned_collision.add(pair)
+                            log.warning(
+                                "discovery: model id %r claimed by both %r and %r; "
+                                "%r wins (config_order)",
+                                mid, winner, key, winner,
+                            )
+                else:
+                    result[mid] = key
+
+        return result
 
     # -- lifecycle ------------------------------------------------------- #
     async def startup(self) -> None:
@@ -1153,6 +1305,15 @@ class EngineManager:
                 tags = await engine.available_tags()
                 if model_id in tags:
                     return engine
+
+        # Discovery index: route to a down-engine that is known (or configured)
+        # to serve this model id.  Only active when cfg.discover.enabled is True.
+        discovered = self._discovered_index()
+        if discovered and model_id in discovered:
+            owner_key = discovered[model_id]
+            owner = self.engines.get(owner_key)
+            if owner is not None:
+                return owner
 
         # A process engine advertises a small, fixed set; if model_id is one of
         # those, use that engine.
@@ -1270,6 +1431,10 @@ class EngineManager:
         metrics.record_swap(prev, target.key, dt, ok=True)
         self._persist()
         log.info("SWAP done: %s -> %s in %.1fs", prev, target.key, dt)
+        # Best-effort: remember what models the newly-active engine serves so
+        # that down-engine discovery can route future requests to it.  Must not
+        # raise or block subsequent in-flight accounting.
+        asyncio.ensure_future(self._snapshot_seen_models(target))
 
     @staticmethod
     def _read_mem_available_kb() -> int | None:
@@ -1388,7 +1553,13 @@ class EngineManager:
             os.makedirs(os.path.dirname(self.cfg.state_file), exist_ok=True)
             with open(self.cfg.state_file, "w") as fh:
                 json.dump(
-                    {"active_engine": self.active_engine, "last_swap": self._last_swap},
+                    {
+                        "active_engine": self.active_engine,
+                        "last_swap": self._last_swap,
+                        "seen_models": {
+                            k: sorted(v) for k, v in self._seen_models.items() if v
+                        },
+                    },
                     fh,
                 )
         except OSError as exc:  # pragma: no cover - best effort
