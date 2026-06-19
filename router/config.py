@@ -194,6 +194,17 @@ class GenericProcessConfig:
     # Optional headers sent on every control/health/readiness call the router
     # makes to this engine (NOT user traffic). Default {} = unchanged.
     control_headers: dict[str, str] = field(default_factory=dict)
+    # When true, the engine is queried at runtime (via its /v1/models endpoint)
+    # to discover models it is serving. Discovered models augment (never replace)
+    # the static `models:` list; they are opt-in and off by default.
+    discover_models: bool = False
+    # Explicit list of model ids this engine is expected to serve. Used when
+    # discover_models is false and you want to pre-declare the models without
+    # a full static models: entry. Ignored when empty.
+    served_models: list[str] = field(default_factory=list)
+    # TTL (seconds) for the cached /v1/models lookup used by model discovery.
+    # Mirrors the same field on OllamaConfig and ApiSwapConfig.
+    tags_cache_ttl_s: float = 30.0
 
 
 @dataclass
@@ -258,6 +269,31 @@ class ApiSwapConfig:
     # secured TabbyAPI, or an Authorization bearer for LM Studio/LocalAI.
     # Default {} = unchanged (no auth header on control calls).
     control_headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class DiscoverConfig:
+    """Global model-discovery settings.
+
+    Discovery is entirely opt-in. The default of ``enabled: false`` means
+    behaviour is byte-identical to a config that omits the ``discover:`` block.
+    When enabled, each engine that has ``discover_models: true`` is queried for
+    its live model list. Discovered models *augment* (never replace) the static
+    ``models:`` list; static entries always take precedence.
+    """
+
+    # Master switch. Discovery is a no-op unless this is true.
+    enabled: bool = False
+    # When true (the default), discovered models are merged into the static
+    # registry. When false, the discovered list is used as the sole registry
+    # (advanced; only useful when the static models: list is intentionally empty).
+    augment_only: bool = True
+    # How to handle a model id found on multiple engines simultaneously.
+    #   "config_order"  -> the engine that appears first in the engines: table wins
+    #   "prefer_up"     -> prefer whichever engine is currently active/up
+    collision: str = "config_order"
+    # Port probe sub-section (parsed from a nested ``port_probe:`` mapping).
+    port_probe_enabled: bool = False
 
 
 # Maps an engine ``type`` to the dataclass holding its parameters.
@@ -339,6 +375,8 @@ class RouterConfig:
     # with a warning). Alias->alias chains and malformed entries are rejected.
     # Default {} = no aliases.
     aliases: dict[str, str] = field(default_factory=dict)
+    # Global model-discovery settings. Absent in config => all defaults (off).
+    discover: DiscoverConfig = field(default_factory=DiscoverConfig)
 
     # Convenience -------------------------------------------------------- #
     def engine_keys(self) -> list[str]:
@@ -440,6 +478,7 @@ def _validate_engine_params(key: str, etype: str, params: Any) -> None:
                 f"engine {key!r} (generic_process): missing required field(s): "
                 f"{', '.join(missing)}"
             )
+        _validate_generic_process_fields(key, params)
     elif etype == "api_swap":
         missing = _required_fields_present(params, ("base_url",))
         if missing:
@@ -465,6 +504,78 @@ def _validate_engine_params(key: str, etype: str, params: Any) -> None:
     elif etype == "ollama":
         if not getattr(params, "base_url", ""):
             raise ConfigError(f"engine {key!r} (ollama): missing required 'base_url'")
+
+
+_DISCOVER_VALID_COLLISION: frozenset[str] = frozenset({"config_order", "prefer_up"})
+_DISCOVER_KNOWN_KEYS: frozenset[str] = frozenset(
+    {"enabled", "augment_only", "collision", "port_probe"}
+)
+_DISCOVER_PORT_PROBE_KNOWN_KEYS: frozenset[str] = frozenset({"enabled"})
+
+
+def _parse_discover_section(raw_discover: Any) -> DiscoverConfig:
+    """Parse the optional top-level ``discover:`` mapping into a DiscoverConfig.
+
+    Absent or null ``discover:`` returns all defaults (fully off). Raises
+    ConfigError on unknown keys or invalid values; mirrors the ConfigError style
+    used elsewhere in load_config.
+    """
+    if not raw_discover:
+        return DiscoverConfig()
+    if not isinstance(raw_discover, dict):
+        raise ConfigError("'discover' must be a mapping")
+
+    unknown = set(raw_discover) - _DISCOVER_KNOWN_KEYS
+    if unknown:
+        raise ConfigError(
+            f"unknown key(s) under 'discover': {sorted(unknown)} "
+            f"(known: {sorted(_DISCOVER_KNOWN_KEYS)})"
+        )
+
+    collision = raw_discover.get("collision", "config_order")
+    if collision not in _DISCOVER_VALID_COLLISION:
+        raise ConfigError(
+            f"discover.collision {collision!r} is not valid "
+            f"(must be one of {sorted(_DISCOVER_VALID_COLLISION)})"
+        )
+
+    port_probe_raw = raw_discover.get("port_probe")
+    port_probe_enabled = False
+    if port_probe_raw is not None:
+        if not isinstance(port_probe_raw, dict):
+            raise ConfigError("'discover.port_probe' must be a mapping")
+        unknown_pp = set(port_probe_raw) - _DISCOVER_PORT_PROBE_KNOWN_KEYS
+        if unknown_pp:
+            raise ConfigError(
+                f"unknown key(s) under 'discover.port_probe': {sorted(unknown_pp)} "
+                f"(known: {sorted(_DISCOVER_PORT_PROBE_KNOWN_KEYS)})"
+            )
+        port_probe_enabled = bool(port_probe_raw.get("enabled", False))
+
+    return DiscoverConfig(
+        enabled=bool(raw_discover.get("enabled", False)),
+        augment_only=bool(raw_discover.get("augment_only", True)),
+        collision=collision,
+        port_probe_enabled=port_probe_enabled,
+    )
+
+
+def _validate_generic_process_fields(key: str, params: GenericProcessConfig) -> None:
+    """Validate the new discovery-related fields on a GenericProcessConfig.
+
+    Called from _validate_engine_params after the base checks pass.
+    """
+    if params.tags_cache_ttl_s < 0:
+        raise ConfigError(
+            f"engine {key!r} (generic_process): tags_cache_ttl_s must be >= 0 "
+            f"(got {params.tags_cache_ttl_s})"
+        )
+    for mid in params.served_models:
+        if not isinstance(mid, str) or not mid:
+            raise ConfigError(
+                f"engine {key!r} (generic_process): served_models must be a list "
+                f"of non-empty strings; got an empty or non-string entry"
+            )
 
 
 def load_config(path: str) -> RouterConfig:
@@ -516,14 +627,17 @@ def load_config(path: str) -> RouterConfig:
             )
         )
 
-    skip = {"ds4", "ollama", "engines", "models"}
+    discover = _parse_discover_section(raw.get("discover"))
+
+    skip = {"ds4", "ollama", "engines", "models", "discover"}
     top = {
         k: v
         for k, v in raw.items()
         if k in RouterConfig.__dataclass_fields__ and k not in skip
     }
     cfg = RouterConfig(
-        ds4=ds4, ollama=ollama, engines=engines, models=models, **top
+        ds4=ds4, ollama=ollama, engines=engines, models=models,
+        discover=discover, **top
     )
 
     # Validate model -> engine references against whatever engines are configured.
@@ -745,8 +859,34 @@ def config_json_schema() -> dict[str, Any]:
         "additionalProperties": True,
     }
 
+    discover_schema = {
+        "type": "object",
+        "description": (
+            "Optional global model-discovery settings. Absent or omitted = all "
+            "defaults (discovery off). Discovery augments the static models: list "
+            "and is entirely opt-in per engine via discover_models: true."
+        ),
+        "properties": {
+            "enabled": {"type": "boolean", "default": False},
+            "augment_only": {"type": "boolean", "default": True},
+            "collision": {
+                "type": "string",
+                "enum": ["config_order", "prefer_up"],
+                "default": "config_order",
+            },
+            "port_probe": {
+                "type": "object",
+                "properties": {
+                    "enabled": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "additionalProperties": False,
+    }
+
     root = _schema_for_dataclass(
-        RouterConfig, exclude=("ds4", "ollama", "engines", "models")
+        RouterConfig, exclude=("ds4", "ollama", "engines", "models", "discover")
     )
     root["properties"]["ds4"] = ds4_schema
     root["properties"]["ollama"] = ollama_schema
@@ -760,6 +900,7 @@ def config_json_schema() -> dict[str, Any]:
         "additionalProperties": engine_entry,
     }
     root["properties"]["models"] = {"type": "array", "items": model_schema}
+    root["properties"]["discover"] = discover_schema
 
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

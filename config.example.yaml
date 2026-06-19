@@ -73,6 +73,16 @@ engines:
     # ready_check: "status==ok"            # richer than HTTP 200; "key==value" or "model:<id>".
     #                                      # vLLM: set ready_path=/v1/models + ready_check="model:<id>"
     #                                      # (vLLM /health is 200 with an EMPTY body before the model serves)
+    # --- opt-in model discovery (off by default) ---
+    # When discover_models is true and the global `discover.enabled` is true,
+    # the router queries this engine's /v1/models at runtime. Discovered models
+    # augment (never replace) the static models: list below; static entries win
+    # on any collision. served_models lets you pre-declare expected model ids
+    # without a full static entry. tags_cache_ttl_s controls how often the live
+    # list is re-fetched.
+    # discover_models: true
+    # served_models: ["Qwen/Qwen2.5-7B-Instruct"]   # explicit model id(s) this engine serves
+    # tags_cache_ttl_s: 30.0
 
   # Ollama, managed by unloading its models (keep_alive:0) on swap-away.
   ollama:
@@ -123,6 +133,17 @@ models:
 # aliases:
 #   gpt-4o-mini: qwen2.5-7b-instruct
 #   claude-3-5-sonnet: llama3.1:8b
+
+# --- Auto-discovery (opt-in) -----------------------------------------------
+# When enabled, engines with `discover_models: true` are queried for their live
+# model lists. Discovered models augment (never replace) the static models: list
+# below; static entries always take precedence. All new behavior is opt-in.
+# discover:
+#   enabled: false           # master switch; discovery is a no-op unless true
+#   augment_only: true       # merge discovered into static list (recommended)
+#   collision: config_order  # config_order (first engine wins) or prefer_up
+#   port_probe:
+#     enabled: false         # probe local ports for running backends (future)
 
 # --- Advanced: the `ds4` escape hatch --------------------------------------
 # `ds4` drives a model through a `systemctl --user` unit (Restart=always)
