@@ -503,15 +503,10 @@
           "type": "boolean",
           "default": false
         },
-        "augment_only": {
-          "type": "boolean",
-          "default": true
-        },
         "collision": {
           "type": "string",
           "enum": [
-            "config_order",
-            "prefer_up"
+            "config_order"
           ],
           "default": "config_order"
         },
