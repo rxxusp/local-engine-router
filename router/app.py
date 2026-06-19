@@ -347,10 +347,10 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                         }
                     )
 
-        # Surface any stopped-engine discovered ids when the routing slice has
-        # populated a _discovered_index on the manager (hasattr guard so this
-        # slice works standalone today and picks up the index after integration).
-        disc = manager._discovered_index() if hasattr(manager, "_discovered_index") else {}
+        # Surface any stopped-engine discovered ids (start_cmd parse, last-seen
+        # cache, or served_models) so a down engine's models still appear here.
+        # _discovered_index() returns {} when discovery is disabled.
+        disc = manager._discovered_index()
         for model_id, engine_key in disc.items():
             if model_id not in seen:
                 seen.add(model_id)
@@ -376,7 +376,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
 
         Calls available_models() on every engine (best-effort, one try/except
         per engine). Also merges in the stopped-engine map from
-        manager._discovered_index() when the routing slice has populated it.
+        manager._discovered_index() (empty when discovery is disabled).
         Auth-gated identically to /admin/swap.
         """
         manager: EngineManager = request.app.state.manager
@@ -391,8 +391,9 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                             engine_key, exc)
                 engines_out[engine_key] = []
 
-        # Merge in any stopped-engine entries from the routing slice's index.
-        disc = manager._discovered_index() if hasattr(manager, "_discovered_index") else {}
+        # Merge in any stopped-engine entries from the discovery index
+        # (empty when discovery is disabled).
+        disc = manager._discovered_index()
         for model_id, engine_key in disc.items():
             bucket = engines_out.setdefault(engine_key, [])
             if model_id not in bucket:
