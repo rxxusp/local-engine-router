@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The project aims to
 follow [Semantic Versioning](https://semver.org/) once it reaches a stable API;
 until then it is in a `0.x` channel where minor versions may break.
 
+## [0.4.0] - 2026-06-19
+
+### Added
+- **Opt-in model auto-discovery** (`discover:` block). A new top-level
+  `discover:` config section enables live model discovery. Discovery is fully
+  opt-in (`enabled: false` by default) and **augments** the static `models:`
+  list -- static entries always win over discovered ones. When
+  `discover.enabled` is false (or the block is absent), router behaviour is
+  byte-identical to previous versions. Collision resolution between engines is
+  controlled by `collision: config_order` (first engine in declaration order
+  wins; the only supported mode). A `port_probe.enabled` sub-key is accepted
+  and validated but reserved for future use.
+- **Per-engine discovery fields on `generic_process` engines.** Set
+  `discover_models: true` on a `generic_process` engine to opt it into the
+  discovery index. Optional supporting fields: `served_models: [..]` (extra
+  hint ids registered even when the engine is stopped) and `tags_cache_ttl_s`
+  (TTL in seconds for the cached `/v1/models` response used during discovery,
+  default 30 s).
+- **Stopped-engine model resolution.** When a `generic_process` engine has
+  `discover_models: true` but is not currently running, the router resolves its
+  candidate model ids from three sources in union: the `start_cmd` argv
+  (parsing `--served-model-name`, `--model`/`-m`, and `.gguf` basenames), a
+  self-healing last-seen cache populated during past uptime and persisted in
+  `state.json`, and the explicit `served_models` list. Down-engine models
+  appear in `GET /v1/models` and route correctly, starting the engine on demand.
+- **All-engine `GET /v1/models` union** (gated on `discover.enabled`). When
+  discovery is enabled, the model list response includes discovered ids from
+  stopped engines in addition to the static registry and live engine tags. When
+  discovery is disabled the endpoint is unchanged.
+- **`POST /admin/discover`** admin endpoint. Calls `available_models()` on
+  every engine (best-effort, one try/except per engine) and merges in
+  stopped-engine entries from the discovery index. Returns a per-engine mapping
+  of sorted model id lists. Auth-gated identically to `POST /admin/swap`.
+- **`routerctl discover`** CLI command. Calls `POST /admin/discover` and prints
+  the per-engine model id summary.
+- **Per-model `disable_thinking_below_max_tokens` guard.** A new integer field
+  on any `models:` entry. When set, the router intercepts
+  `POST /v1/chat/completions` for that model and injects
+  `enable_thinking: false` into the request body if the request's `max_tokens`
+  is below the threshold and the client has not explicitly set `enable_thinking`.
+  This prevents models from allocating a thinking budget that exceeds the
+  available token budget, which can produce empty responses. Explicit client
+  values are never overridden.
+
 ## [0.3.0] - 2026-06-18
 
 ### Fixed
