@@ -28,6 +28,14 @@ DEFAULT_CONFIG = os.environ.get(
 
 
 def main() -> None:
+    # `init` is the interactive setup wizard (detect engines + scaffold a
+    # config). It has its own argument parser, so intercept it before this
+    # serve-oriented one runs: `local-engine-router init [--config X --yes ...]`.
+    argv = sys.argv[1:]
+    if argv and argv[0] == "init":
+        from .wizard import run_init
+        sys.exit(run_init(argv[1:]))
+
     ap = argparse.ArgumentParser(prog="router", description="local-engine LLM router")
     ap.add_argument("--config", default=DEFAULT_CONFIG, help="path to config.yaml")
     ap.add_argument(

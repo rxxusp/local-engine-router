@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The project aims to
 follow [Semantic Versioning](https://semver.org/) once it reaches a stable API;
 until then it is in a `0.x` channel where minor versions may break.
 
+## [0.5.0] - 2026-06-19
+
+This release is about getting from zero to a running router in a couple of
+copy-paste steps. Everything is additive and opt-in; existing installs and
+configs keep working unchanged.
+
+### Added
+- **One-command bootstrap installer** (`install.sh` at the repo root). Run it
+  with `curl -fsSL .../install.sh | bash` and it creates an isolated virtualenv,
+  installs the package and its dependencies, puts `local-engine-router` and
+  `routerctl` on your `PATH`, writes a starter config if none exists, and offers
+  to install and enable the systemd `--user` service. It is idempotent and safe
+  to re-run, prints what it will do, and is fully parameterised by environment
+  variables (`LER_VENV`, `LER_CONFIG`, `LER_BIN`, `LER_UNIT_DIR`, `LER_SOURCE`)
+  with `--yes`, `--no-service`, `--dry-run`, `--print-unit`, and `--uninstall`
+  flags.
+- **Interactive setup wizard** (`local-engine-router init`, also `routerctl
+  init`). It probes the well-known localhost ports of every supported backend
+  (Ollama 11434, llama.cpp/LocalAI 8080, vLLM/MAX 8000, SGLang 30000, LM Studio
+  1234, TabbyAPI 5000, KoboldCpp 5001), confirms what is actually listening,
+  fetches each engine's live model list, asks the few things it cannot infer
+  (bind host, API key, which detected engines to include), and scaffolds a
+  working `config.yaml` from the matching presets. It is suggest-and-confirm:
+  an open port that does not confirm as a known backend is never added without
+  an explicit yes. Modes: `--yes` (non-interactive), `--example` (write a
+  commented starter without probing), `--detect-only` (report and write
+  nothing), `--force`, `--host`, `--port`, `--config`, `--probe-host`. The
+  generated config is validated through the real loader before it is written,
+  so the wizard never leaves an invalid config behind. The wizard does its own
+  well-known-port probing; the `discover.port_probe` config flag reserved in
+  0.4.0 stays parse-only and is not yet consumed at runtime.
+- **Docker quickstart** (`docker-compose.yml` at the repo root) using the
+  published multi-arch `ghcr.io/rxxusp/local-engine-router` image, for people
+  who prefer containers.
+- **Tag-triggered PyPI publish workflow** (`.github/workflows/pypi-publish.yml`).
+  On a `v*` tag it asserts the tag matches the package version, builds an sdist
+  and wheel, and publishes to PyPI via Trusted Publishing (OIDC, no stored
+  token). It is gated behind the `ENABLE_PYPI_PUBLISH` repository variable so it
+  stays dormant until a maintainer opts in; see the README install section for
+  the one-time PyPI setup.
+
+### Changed
+- **README rewritten around a friendly Install / Quickstart** near the top with
+  three pick-your-path options (one-line script, pip/pipx, Docker), the `init`
+  wizard, and a first curl request, aiming for under five minutes to a working
+  router. The deeper docs (swap mechanic, engine types, presets, auto-discovery,
+  sharp edges) are unchanged below it.
+
 ## [0.4.0] - 2026-06-19
 
 ### Added

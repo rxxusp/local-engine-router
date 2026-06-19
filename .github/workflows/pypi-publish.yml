@@ -1,0 +1,87 @@
+# Publish the package to PyPI on version tags (v*).
+#
+# This job is DORMANT by default: it only runs when the repository variable
+# ENABLE_PYPI_PUBLISH is set to "true". To turn it on (one time, by a maintainer
+# with the PyPI account):
+#
+#   1. On PyPI, add a Trusted Publisher for this project:
+#        owner            = rxxusp
+#        repository       = local-engine-router
+#        workflow name    = pypi-publish.yml
+#        environment      = pypi
+#      (PyPI -> your project -> Settings -> Publishing -> Add a pending publisher.
+#       For the very first release, create the project as a "pending" publisher.)
+#   2. In this repo: Settings -> Secrets and variables -> Actions -> Variables,
+#      add a variable ENABLE_PYPI_PUBLISH = true.
+#
+# With Trusted Publishing (OIDC) no API token is stored anywhere. If you prefer a
+# token instead, set a PYPI_API_TOKEN secret and pass it to the publish step
+# (see the commented `with:` block below).
+name: pypi-publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+jobs:
+  build-and-publish:
+    if: ${{ vars.ENABLE_PYPI_PUBLISH == 'true' }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write # OIDC for PyPI Trusted Publishing; no stored token needed
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # On tag pushes: assert the git tag (v1.2.3 -> 1.2.3) matches both
+      # pyproject.toml [project].version and router/__init__.__version__, so a
+      # mismatched release fails before anything is uploaded to PyPI.
+      - name: Assert tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          TOML_VER="$(python3 - <<'EOF'
+          import tomllib
+          with open("pyproject.toml", "rb") as f:
+              print(tomllib.load(f)["project"]["version"])
+          EOF
+          )"
+          INIT_VER="$(python3 -c "import ast, pathlib; src=pathlib.Path('router/__init__.py').read_text(); [print(ast.literal_eval(n.value)) for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id=='__version__' for t in n.targets)]")"
+          echo "tag=$TAG  pyproject=$TOML_VER  __version__=$INIT_VER"
+          if [ "$TAG" != "$TOML_VER" ]; then
+            echo "ERROR: git tag $TAG does not match pyproject.toml version $TOML_VER" >&2
+            exit 1
+          fi
+          if [ -n "$INIT_VER" ] && [ "$TAG" != "$INIT_VER" ]; then
+            echo "ERROR: git tag $TAG does not match router/__version__ $INIT_VER" >&2
+            exit 1
+          fi
+          echo "Version check passed: $TAG"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Check artifacts
+        run: |
+          python -m pip install --upgrade twine
+          twine check dist/*
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # To use an API token instead of Trusted Publishing, uncomment:
+        # with:
+        #   password: ${{ secrets.PYPI_API_TOKEN }}

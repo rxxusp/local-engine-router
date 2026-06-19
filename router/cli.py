@@ -256,6 +256,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="command", required=True)
 
+    sub.add_parser(
+        "init",
+        help="setup wizard: detect running engines and scaffold a config.yaml",
+        add_help=False,
+    )
     sub.add_parser("status", help="show active engine and in-flight counts")
     sub.add_parser("models", help="list all known models (id, engine, name)")
     sub.add_parser("discover", help="scan all engines for discoverable models (POST /admin/discover)")
@@ -280,6 +285,14 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
+    # `init` is the setup wizard; it owns its own argument parser, so intercept
+    # it before the subcommand parser runs (which lets `routerctl init --config
+    # X --yes ...` pass straight through to the wizard).
+    argv = sys.argv[1:]
+    if argv and argv[0] == "init":
+        from . import wizard
+        sys.exit(wizard.run_init(argv[1:]))
+
     parser = build_parser()
     args = parser.parse_args()
 

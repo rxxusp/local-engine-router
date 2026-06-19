@@ -15,6 +15,165 @@ causes OOM failures.
 
 ---
 
+## Install
+
+Pick whichever path fits. All three leave the same `local-engine-router` and
+`routerctl` commands on your `PATH`. The router needs Python >= 3.10 and no GPU.
+
+### Option 1: one-line script (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rxxusp/local-engine-router/main/install.sh | bash
+```
+
+This creates an isolated virtualenv, installs the package and its dependencies
+into it, links `local-engine-router` and `routerctl` into `~/.local/bin`, writes
+a starter config if you do not have one, and offers to install and enable the
+systemd `--user` service. It is idempotent, so re-run it any time to upgrade.
+
+Pass flags through the pipe with `-s --`:
+
+```bash
+curl -fsSL .../install.sh | bash -s -- --yes         # non-interactive; enable the service
+curl -fsSL .../install.sh | bash -s -- --no-service  # skip systemd
+```
+
+The installer is parameterised by environment variables (`LER_VENV`,
+`LER_CONFIG`, `LER_BIN`, `LER_UNIT_DIR`) and supports `--dry-run`,
+`--print-unit`, and `--uninstall`. Run `install.sh --help` for the full list.
+
+### Option 2: pip / pipx
+
+```bash
+# Once published to PyPI:
+pipx install local-engine-router        # isolated, recommended
+pip install local-engine-router         # into the current environment
+
+# Until then (or to track main), install straight from GitHub:
+pipx install "git+https://github.com/rxxusp/local-engine-router.git"
+```
+
+The package installs both console scripts, `local-engine-router` and
+`routerctl`.
+
+### Option 3: Docker
+
+```bash
+docker run --rm -p 8077:8077 \
+  -v "$PWD/config.yaml:/app/config.yaml" \
+  --add-host host.docker.internal:host-gateway \
+  ghcr.io/rxxusp/local-engine-router:latest
+```
+
+Or with the bundled compose file:
+
+```bash
+docker compose up -d      # uses docker-compose.yml in this repo
+```
+
+The image is pure Python (no CUDA) and is published for `linux/amd64` and
+`linux/arm64` on every `v*` tag. Inside a container, point each engine's
+`base_url` at `http://host.docker.internal:<port>` instead of `127.0.0.1`, and
+note that only `api_swap` and `ollama` engines work from a container (see
+[Container limitation](#container-limitation)).
+
+> **Maintainers:** the PyPI path goes live once a PyPI Trusted Publisher is
+> configured and the `ENABLE_PYPI_PUBLISH` repository variable is set to `true`.
+> See [`.github/workflows/pypi-publish.yml`](.github/workflows/pypi-publish.yml)
+> for the exact one-time setup.
+
+
+## Quickstart
+
+From zero to a running router in three steps:
+
+```bash
+# 1. Install (any path above). For example:
+curl -fsSL https://raw.githubusercontent.com/rxxusp/local-engine-router/main/install.sh | bash
+
+# 2. Detect your running engines and write them into the config the service reads.
+#    The installer prints this path as `conf:`; for the one-line install it is:
+local-engine-router init --config ~/.config/local-engine-router/config.yaml
+
+# 3. Restart so the router picks up the new config, then list its models:
+routerctl restart
+curl http://127.0.0.1:8077/v1/models
+```
+
+> Point `init` at the config the router actually loads. A script install reads
+> `~/.config/local-engine-router/config.yaml` (the `conf:` path the installer
+> prints). A pip/manual install has no service, so run `init` with no `--config`
+> (it writes `./config.yaml`) and start the router directly with
+> `local-engine-router --config ./config.yaml`.
+
+### The `init` wizard
+
+`local-engine-router init` (also `routerctl init`) probes the well-known
+localhost ports of every supported backend (Ollama, llama.cpp, vLLM, SGLang, LM
+Studio, TabbyAPI, KoboldCpp), confirms what is actually listening, fetches each
+engine's live model list, and scaffolds a working `config.yaml` from the
+matching presets. It asks only what it cannot infer: bind host, an optional API
+key, and which detected engines to include.
+
+It is suggest-and-confirm: a port that is open but does not confirm as a known
+backend is never added without an explicit yes, so the router never routes to an
+unmanaged port silently. The generated config is validated through the real
+loader before it is written.
+
+```bash
+local-engine-router init                 # interactive
+local-engine-router init --yes           # non-interactive; include all confirmed engines
+local-engine-router init --detect-only   # just report what is running, write nothing
+local-engine-router init --example       # write a commented starter, no probing
+```
+
+Engines the router drives purely over HTTP (Ollama, LM Studio, TabbyAPI) work
+with no further editing. For engines the router launches itself (llama.cpp,
+vLLM, SGLang, KoboldCpp), fill in `start_cmd` in the generated config so the
+router can restart them after a swap; the wizard prints which ones still need it.
+
+### Your first request
+
+```bash
+curl http://127.0.0.1:8077/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"<a-model-id-from-/v1/models>","messages":[{"role":"user","content":"hello"}],"stream":false}'
+```
+
+The router logs `SWAP begin:` / `SWAP done:` lines as it switches engines. Check
+`GET /health` for liveness and `GET /status` (or `routerctl status`) for full
+engine state. Validate a config without starting:
+
+```bash
+python3 -m router --check-config --config config.yaml
+```
+
+### Run it as a service (Linux)
+
+The one-line installer offers to set up a systemd `--user` service pointing at
+its virtualenv. If you installed from a git checkout instead, use the
+checkout-based installer:
+
+```bash
+bash deploy/install.sh        # copies the unit, enables lingering, starts it
+```
+
+Or wire the unit up by hand:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/local-engine-router.service ~/.config/systemd/user/
+sudo loginctl enable-linger "$USER"    # boot-start without a login session
+systemctl --user daemon-reload
+systemctl --user enable --now local-engine-router
+```
+
+The checkout unit uses `%h` (systemd's home placeholder) for all paths, so it
+works for any user without editing. macOS and Windows have no systemd; run
+`local-engine-router --config config.yaml` directly or under your own supervisor.
+
+---
+
 ## How the GPU swap works
 
 This is the core mechanic that distinguishes local-engine-router from simpler
@@ -85,78 +244,6 @@ cleanly on a normal control-flow path (not under `CancelledError`).
 
 **Non-streaming requests** cannot carry keep-alive frames and block for the
 entire swap. See [Sharp edges](#sharp-edges).
-
-
-## Quickstart
-
-```bash
-# 1. Clone and install (Python >= 3.10; no GPU required)
-git clone https://github.com/rxxusp/local-engine-router.git
-cd local-engine-router
-pip install .
-
-# 2. Write a minimal config
-cat > config.yaml << 'EOF'
-host: 127.0.0.1
-port: 8077
-
-engines:
-  llamacpp:
-    type: generic_process
-    base_url: http://127.0.0.1:8080
-    start_cmd:
-      - /usr/local/bin/llama-server
-      - -m
-      - /models/my-model.gguf
-      - --port
-      - "8080"
-    ready_path: /health
-
-models:
-  - id: my-model
-    engine: llamacpp
-EOF
-
-# 3. Start the router
-local-engine-router --config config.yaml
-
-# 4. Hit it (same interface as OpenAI)
-curl http://127.0.0.1:8077/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"my-model","messages":[{"role":"user","content":"hello"}],"stream":false}'
-```
-
-The router logs `SWAP begin:` / `SWAP done:` lines as it works. Check
-`GET /health` for liveness and `GET /status` for full engine state.
-
-### systemd (Linux only)
-
-```bash
-# One-shot idempotent installer: copies the unit, enables lingering, starts it.
-bash deploy/install.sh
-
-# Or manually:
-mkdir -p ~/.config/systemd/user
-cp deploy/local-engine-router.service ~/.config/systemd/user/
-sudo loginctl enable-linger "$USER"    # boot-start without a login session
-systemctl --user daemon-reload
-systemctl --user enable --now local-engine-router
-```
-
-The unit file is `deploy/local-engine-router.service` and uses `%h` (systemd's
-home-directory placeholder) for all paths, so it works for any user without
-editing.
-
-### Docker
-
-```bash
-docker run --rm -p 8077:8077 \
-  -v "$PWD/config.yaml:/app/config.yaml" \
-  ghcr.io/rxxusp/local-engine-router:latest
-```
-
-The image (`python:3.12-slim`, no CUDA) is published on every `v*` tag. See
-[Container limitation](#container-limitation) under Sharp edges below.
 
 
 ## Platform support

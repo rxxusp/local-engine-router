@@ -1,0 +1,28 @@
+# Docker quickstart for local-engine-router.
+# ---------------------------------------------------------------------------
+#   1. Put a config.yaml next to this file (see config.example.yaml, or run
+#      `local-engine-router init` somewhere to generate one).
+#   2. docker compose up -d
+#   3. curl http://127.0.0.1:8077/v1/models
+#
+# The image is pure Python (no CUDA, no GPU). The router only proxies to the
+# inference engines, which run on the HOST. Inside a container 127.0.0.1 is the
+# container itself, so in your mounted config set each engine's base_url to
+# http://host.docker.internal:<port> (mapped to the host gateway below), NOT
+# 127.0.0.1.
+#
+# Container limitation: process-control engine types (generic_process / ds4)
+# cannot reach the host's process tree, so only `api_swap` and `ollama` engines
+# work from the container. Run the router on the host (pip / install.sh) if you
+# need the router to launch and stop engine processes itself.
+services:
+  router:
+    image: ghcr.io/rxxusp/local-engine-router:latest
+    container_name: local-engine-router
+    restart: unless-stopped
+    ports:
+      - "8077:8077"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -29,6 +29,10 @@ tests/
 CHANGELOG.md
 deploy/
 
+# Install / compose helpers (not needed inside the runtime image)
+install.sh
+docker-compose.yml
+
 # Internal dev/build scripts
 .build-workflow.js
 .research-workflow.js
