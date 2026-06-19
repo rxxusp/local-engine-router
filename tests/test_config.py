@@ -16,6 +16,7 @@ import pytest
 
 from router.config import (
     ConfigError,
+    DiscoverConfig,
     config_json_schema,
     load_config,
 )
@@ -228,3 +229,226 @@ def test_config_json_schema_describes_engines_and_models():
         arm["properties"]["type"]["const"] for arm in engine_entry["oneOf"]
     }
     assert consts == {"ds4", "ollama", "generic_process", "api_swap"}
+
+
+# --------------------------------------------------------------------------- #
+# New fields: GenericProcessConfig (discover_models, served_models,
+#             tags_cache_ttl_s) and DiscoverConfig / RouterConfig.discover
+# --------------------------------------------------------------------------- #
+
+class TestGenericProcessNewFields:
+    """GenericProcessConfig gets three new optional fields with safe defaults."""
+
+    def test_defaults_when_absent(self, tmp_path):
+        """Existing config without the new fields loads identically (back-compat)."""
+        path = _write(
+            tmp_path,
+            """
+            engines:
+              vllm:
+                type: generic_process
+                base_url: http://127.0.0.1:8000
+                start_cmd: ["/usr/local/bin/vllm", "serve"]
+            """,
+        )
+        cfg = load_config(path)
+        params = cfg.engines[0].params
+        assert params.discover_models is False
+        assert params.served_models == []
+        assert params.tags_cache_ttl_s == 30.0
+
+    def test_explicit_values_round_trip(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            engines:
+              vllm:
+                type: generic_process
+                base_url: http://127.0.0.1:8000
+                start_cmd: ["/usr/local/bin/vllm", "serve"]
+                discover_models: true
+                served_models: ["meta-llama/Llama-3.1-8B", "openai/gpt-4"]
+                tags_cache_ttl_s: 60.0
+            """,
+        )
+        cfg = load_config(path)
+        params = cfg.engines[0].params
+        assert params.discover_models is True
+        assert params.served_models == ["meta-llama/Llama-3.1-8B", "openai/gpt-4"]
+        assert params.tags_cache_ttl_s == 60.0
+
+    def test_served_models_must_be_nonempty_strings(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            engines:
+              vllm:
+                type: generic_process
+                base_url: http://127.0.0.1:8000
+                start_cmd: ["/usr/local/bin/vllm", "serve"]
+                served_models: ["valid-model", ""]
+            """,
+        )
+        with pytest.raises(ConfigError, match="non-empty strings"):
+            load_config(path)
+
+    def test_tags_cache_ttl_s_must_be_nonnegative(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            engines:
+              vllm:
+                type: generic_process
+                base_url: http://127.0.0.1:8000
+                start_cmd: ["/usr/local/bin/vllm", "serve"]
+                tags_cache_ttl_s: -1.0
+            """,
+        )
+        with pytest.raises(ConfigError, match="tags_cache_ttl_s must be >= 0"):
+            load_config(path)
+
+    def test_tags_cache_ttl_s_zero_is_valid(self, tmp_path):
+        """Zero is a valid TTL (disables caching)."""
+        path = _write(
+            tmp_path,
+            """
+            engines:
+              vllm:
+                type: generic_process
+                base_url: http://127.0.0.1:8000
+                start_cmd: ["/usr/local/bin/vllm", "serve"]
+                tags_cache_ttl_s: 0.0
+            """,
+        )
+        cfg = load_config(path)
+        assert cfg.engines[0].params.tags_cache_ttl_s == 0.0
+
+
+class TestDiscoverConfig:
+    """DiscoverConfig + RouterConfig.discover field."""
+
+    def test_default_when_absent(self):
+        """No discover: block => all defaults (feature fully off)."""
+        cfg = load_config("/nonexistent/config.yaml")
+        d = cfg.discover
+        assert isinstance(d, DiscoverConfig)
+        assert d.enabled is False
+        assert d.augment_only is True
+        assert d.collision == "config_order"
+        assert d.port_probe_enabled is False
+
+    def test_discover_block_parsed(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            discover:
+              enabled: true
+              augment_only: false
+              collision: prefer_up
+              port_probe:
+                enabled: true
+            """,
+        )
+        cfg = load_config(path)
+        d = cfg.discover
+        assert d.enabled is True
+        assert d.augment_only is False
+        assert d.collision == "prefer_up"
+        assert d.port_probe_enabled is True
+
+    def test_discover_partial_override_uses_defaults_for_rest(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            discover:
+              enabled: true
+            """,
+        )
+        cfg = load_config(path)
+        d = cfg.discover
+        assert d.enabled is True
+        # Unspecified keys fall back to DiscoverConfig defaults.
+        assert d.augment_only is True
+        assert d.collision == "config_order"
+        assert d.port_probe_enabled is False
+
+    def test_unknown_key_under_discover_raises(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            discover:
+              enabled: true
+              not_a_real_key: oops
+            """,
+        )
+        with pytest.raises(ConfigError, match="unknown key"):
+            load_config(path)
+
+    def test_unknown_key_under_port_probe_raises(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            discover:
+              port_probe:
+                enabled: false
+                bogus_key: 42
+            """,
+        )
+        with pytest.raises(ConfigError, match="unknown key"):
+            load_config(path)
+
+    def test_invalid_collision_value_raises(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            discover:
+              collision: not_a_valid_value
+            """,
+        )
+        with pytest.raises(ConfigError, match="collision"):
+            load_config(path)
+
+    def test_both_collision_valid_values_accepted(self, tmp_path):
+        for val in ("config_order", "prefer_up"):
+            path = _write(
+                tmp_path,
+                f"""
+                discover:
+                  collision: {val}
+                """,
+            )
+            cfg = load_config(path)
+            assert cfg.discover.collision == val
+
+
+class TestSchemaNewFields:
+    """JSON schema includes the new generic_process properties and discover block."""
+
+    def test_generic_process_schema_has_new_fields(self):
+        schema = config_json_schema()
+        engine_entry = schema["properties"]["engines"]["additionalProperties"]
+        gp_arm = next(
+            a for a in engine_entry["oneOf"]
+            if a["properties"]["type"]["const"] == "generic_process"
+        )
+        gp_props = gp_arm["properties"]
+        assert "discover_models" in gp_props
+        assert "served_models" in gp_props
+        assert "tags_cache_ttl_s" in gp_props
+        assert gp_props["discover_models"] == {"type": "boolean", "default": False}
+        assert gp_props["tags_cache_ttl_s"] == {"type": "number", "default": 30.0}
+
+    def test_discover_block_in_schema(self):
+        schema = config_json_schema()
+        assert "discover" in schema["properties"]
+        d = schema["properties"]["discover"]
+        assert d["type"] == "object"
+        assert "enabled" in d["properties"]
+        assert "collision" in d["properties"]
+        assert "port_probe" in d["properties"]
+        assert d["additionalProperties"] is False
+
+    def test_schema_still_round_trips_as_json(self):
+        schema = config_json_schema()
+        text = __import__("json").dumps(schema)
+        assert __import__("json").loads(text) == schema
