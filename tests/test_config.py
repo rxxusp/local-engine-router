@@ -323,6 +323,38 @@ class TestGenericProcessNewFields:
         cfg = load_config(path)
         assert cfg.engines[0].params.tags_cache_ttl_s == 0.0
 
+    def test_tags_cache_ttl_s_non_numeric_raises(self, tmp_path):
+        """A non-numeric tags_cache_ttl_s must raise a clear ConfigError."""
+        path = _write(
+            tmp_path,
+            """
+            engines:
+              vllm:
+                type: generic_process
+                base_url: http://127.0.0.1:8000
+                start_cmd: ["/usr/local/bin/vllm", "serve"]
+                tags_cache_ttl_s: "not-a-number"
+            """,
+        )
+        with pytest.raises(ConfigError, match="tags_cache_ttl_s"):
+            load_config(path)
+
+    def test_served_models_bare_string_raises(self, tmp_path):
+        """A bare string for served_models must raise (not silently split chars)."""
+        path = _write(
+            tmp_path,
+            """
+            engines:
+              vllm:
+                type: generic_process
+                base_url: http://127.0.0.1:8000
+                start_cmd: ["/usr/local/bin/vllm", "serve"]
+                served_models: "single-string-not-a-list"
+            """,
+        )
+        with pytest.raises(ConfigError, match="served_models"):
+            load_config(path)
+
 
 class TestDiscoverConfig:
     """DiscoverConfig + RouterConfig.discover field."""
@@ -333,7 +365,6 @@ class TestDiscoverConfig:
         d = cfg.discover
         assert isinstance(d, DiscoverConfig)
         assert d.enabled is False
-        assert d.augment_only is True
         assert d.collision == "config_order"
         assert d.port_probe_enabled is False
 
@@ -343,8 +374,7 @@ class TestDiscoverConfig:
             """
             discover:
               enabled: true
-              augment_only: false
-              collision: prefer_up
+              collision: config_order
               port_probe:
                 enabled: true
             """,
@@ -352,8 +382,7 @@ class TestDiscoverConfig:
         cfg = load_config(path)
         d = cfg.discover
         assert d.enabled is True
-        assert d.augment_only is False
-        assert d.collision == "prefer_up"
+        assert d.collision == "config_order"
         assert d.port_probe_enabled is True
 
     def test_discover_partial_override_uses_defaults_for_rest(self, tmp_path):
@@ -368,7 +397,6 @@ class TestDiscoverConfig:
         d = cfg.discover
         assert d.enabled is True
         # Unspecified keys fall back to DiscoverConfig defaults.
-        assert d.augment_only is True
         assert d.collision == "config_order"
         assert d.port_probe_enabled is False
 
@@ -408,17 +436,95 @@ class TestDiscoverConfig:
         with pytest.raises(ConfigError, match="collision"):
             load_config(path)
 
-    def test_both_collision_valid_values_accepted(self, tmp_path):
-        for val in ("config_order", "prefer_up"):
-            path = _write(
-                tmp_path,
-                f"""
-                discover:
-                  collision: {val}
-                """,
-            )
-            cfg = load_config(path)
-            assert cfg.discover.collision == val
+    def test_config_order_collision_accepted(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            discover:
+              collision: config_order
+            """,
+        )
+        cfg = load_config(path)
+        assert cfg.discover.collision == "config_order"
+
+    def test_prefer_up_collision_rejected(self, tmp_path):
+        """prefer_up is not implemented; the parser must reject it."""
+        path = _write(
+            tmp_path,
+            """
+            discover:
+              collision: prefer_up
+            """,
+        )
+        with pytest.raises(ConfigError, match="collision"):
+            load_config(path)
+
+
+class TestDiscoverRemovedKnobs:
+    """Removed DiscoverConfig knobs must now be rejected, not silently no-op."""
+
+    def test_augment_only_is_rejected_as_unknown_key(self, tmp_path):
+        """augment_only was removed; the parser must reject it as an unknown key."""
+        path = _write(
+            tmp_path,
+            """
+            discover:
+              enabled: true
+              augment_only: true
+            """,
+        )
+        with pytest.raises(ConfigError, match="unknown key"):
+            load_config(path)
+
+    def test_discover_config_has_no_augment_only_attr(self):
+        """DiscoverConfig must not expose augment_only at all."""
+        d = DiscoverConfig()
+        assert not hasattr(d, "augment_only")
+
+
+class TestModelThinkingFloorValidation:
+    """disable_thinking_below_max_tokens validation raises clear ConfigError."""
+
+    def test_valid_floor_accepted(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            models:
+              - id: gemma
+                engine: ds4
+                disable_thinking_below_max_tokens: 512
+            """,
+        )
+        cfg = load_config(path)
+        assert cfg.models[0].disable_thinking_below_max_tokens == 512
+
+    def test_non_integer_floor_raises(self, tmp_path):
+        """A non-integer value must raise a clear ConfigError, not a raw ValueError."""
+        path = _write(
+            tmp_path,
+            """
+            models:
+              - id: gemma
+                engine: ds4
+                disable_thinking_below_max_tokens: "not-a-number"
+            """,
+        )
+        with pytest.raises(ConfigError, match="disable_thinking_below_max_tokens"):
+            load_config(path)
+
+    def test_zero_floor_raises(self, tmp_path):
+        """Value below 1 must raise ConfigError (existing check, just confirmed)."""
+        path = _write(
+            tmp_path,
+            """
+            models:
+              - id: gemma
+                engine: ds4
+                disable_thinking_below_max_tokens: 0
+            """,
+        )
+        with pytest.raises(ConfigError, match="disable_thinking_below_max_tokens"):
+            load_config(path)
 
 
 class TestSchemaNewFields:
@@ -446,6 +552,8 @@ class TestSchemaNewFields:
         assert "enabled" in d["properties"]
         assert "collision" in d["properties"]
         assert "port_probe" in d["properties"]
+        assert "augment_only" not in d["properties"]
+        assert d["properties"]["collision"]["enum"] == ["config_order"]
         assert d["additionalProperties"] is False
 
     def test_schema_still_round_trips_as_json(self):
