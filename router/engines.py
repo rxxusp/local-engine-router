@@ -69,6 +69,36 @@ _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 _warned_collision: set[tuple[str, str]] = set()
 
 
+def _is_python_module(val: str) -> bool:
+    """Return True when *val* looks like a Python module name, not a model path.
+
+    A Python module passed to 'python -m <module>' contains a '.' (package
+    separator), has no path separator '/', and does not end with .gguf (any
+    case). Examples: 'sglang.launch_server', 'vllm.entrypoints.openai.api_server'.
+    Plain model names like 'my-model' or file paths like '/storage/weights/gemma'
+    do not match and are passed through unchanged."""
+    if not val:
+        return False
+    if "/" in val:
+        return False
+    if val.lower().endswith(".gguf"):
+        return False
+    return "." in val
+
+
+def _add_model_id(ids: set[str], val: str) -> None:
+    """Add *val* (and optionally a .gguf basename) to *ids*.
+
+    Guards against adding an empty string when the path is bare '.gguf'."""
+    if not val:
+        return
+    ids.add(val)
+    if val.lower().endswith(".gguf"):
+        base = os.path.basename(val)[: -len(".gguf")]
+        if base:
+            ids.add(base)
+
+
 def served_ids_from_start_cmd(start_cmd: list[str] | str) -> set[str]:
     """Extract the set of model ids a GenericProcessEngine command will serve.
 
@@ -78,9 +108,18 @@ def served_ids_from_start_cmd(start_cmd: list[str] | str) -> set[str]:
                             vLLM/SGLang allow multiple, so all are ids)
       -m / --model / --model-path  <first value only>
 
-    Additionally, if any value ends with .gguf, the basename without the
-    extension is added as a second id (so a llama.cpp -m path/to/my-model.gguf
-    advertises both the path and ``my-model`` as valid request ids).
+    Both space-separated (--flag value) and '='-joined (--flag=value) forms are
+    handled.  For --served-model-name, the '='-form carries exactly ONE value;
+    the multi-value collection applies only to the space-separated form.
+
+    Additionally, if any value ends with .gguf (case-insensitive), the basename
+    without the extension is added as a second id (so a llama.cpp
+    -m path/to/my-model.gguf advertises both the path and ``my-model``).
+
+    The '-m' flag is also used by 'python -m <module>'. Values that look like a
+    Python module (contain '.' and no '/' and do not end with .gguf) are skipped
+    so that 'python -m sglang.launch_server --model-path /x' does not produce the
+    spurious id 'sglang.launch_server'.
 
     Returns an empty set if nothing is found. Deterministic, no side effects.
     """
@@ -97,26 +136,38 @@ def served_ids_from_start_cmd(start_cmd: list[str] | str) -> set[str]:
     while i < len(argv):
         tok = argv[i]
 
-        if tok == "--served-model-name":
-            # Collect all following values that are not flags.
-            i += 1
-            while i < len(argv) and not argv[i].startswith("-"):
-                val = argv[i]
-                if val:
-                    ids.add(val)
-                    if val.endswith(".gguf"):
-                        ids.add(os.path.basename(val)[: -len(".gguf")])
+        # Handle '='-joined form: --flag=value splits into (flag, '=', value).
+        flag, eq, eq_val = tok.partition("=")
+
+        if flag == "--served-model-name":
+            if eq:
+                # '='-joined form: exactly one value.
+                _add_model_id(ids, eq_val)
                 i += 1
+            else:
+                # Space-separated form: collect all following non-flag values.
+                i += 1
+                while i < len(argv) and not argv[i].startswith("-"):
+                    _add_model_id(ids, argv[i])
+                    i += 1
             continue
 
-        if tok in ("-m", "--model", "--model-path"):
-            if i + 1 < len(argv):
+        if flag in ("-m", "--model", "--model-path"):
+            if eq:
+                # '='-joined form: value is eq_val.
+                val = eq_val
+                i += 1
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("-"):
                 val = argv[i + 1]
-                if val and not val.startswith("-"):
-                    ids.add(val)
-                    if val.endswith(".gguf"):
-                        ids.add(os.path.basename(val)[: -len(".gguf")])
-            i += 2
+                i += 2
+            else:
+                i += 1
+                continue
+            # For -m, skip values that look like a Python module name rather
+            # than a model path or .gguf file.
+            if flag == "-m" and _is_python_module(val):
+                continue
+            _add_model_id(ids, val)
             continue
 
         i += 1
@@ -742,19 +793,20 @@ class GenericProcessEngine(Engine):
         not-ready, HTTP error, or parse failure the method returns an empty set
         (best-effort: never raises, never starts the engine).
 
+        The negative (not-ready) and error cases are also cached so that a down
+        engine is probed at most once per TTL rather than on every call.
+
         The model list is fetched from base_url + /v1/models (the standard
         OpenAI endpoint). ready_path is used only by is_ready() and is not
         repurposed here. Parses the OpenAI /v1/models response shape (data[].id).
-        Uses getattr with a 30.0 default for tags_cache_ttl_s because that
-        config field may not yet exist on the cfg object (added by a parallel
-        slice).
         """
         loop = asyncio.get_running_loop()
         now = loop.time()
-        ttl = getattr(self.cfg, "tags_cache_ttl_s", 30.0)
+        ttl = self.cfg.tags_cache_ttl_s
         if self._models_cache and now - self._models_cache[0] < ttl:
             return self._models_cache[1]
         if not await self.is_ready():
+            self._models_cache = (now, set())
             return set()
         # Always use the standard OpenAI model-list endpoint. The ready_path
         # is used only as the liveness probe in is_ready(); the model catalogue
@@ -763,9 +815,11 @@ class GenericProcessEngine(Engine):
         try:
             r = await self._ctl.get(self.base_url + "/v1/models")
             if r.status_code != 200:
+                self._models_cache = (now, set())
                 return set()
             data = r.json()
         except (httpx.HTTPError, OSError, ValueError):
+            self._models_cache = (now, set())
             return set()
         try:
             ids: set[str] = set()
@@ -775,6 +829,7 @@ class GenericProcessEngine(Engine):
                     if isinstance(model_id, str) and model_id:
                         ids.add(model_id)
         except (AttributeError, TypeError):
+            self._models_cache = (now, set())
             return set()
         self._models_cache = (now, ids)
         return ids
@@ -1172,16 +1227,18 @@ class EngineManager:
             pass  # missing file, bad JSON, wrong types — all fine
 
     async def _snapshot_seen_models(self, engine: Engine) -> None:
-        """Update _seen_models[engine.key] with available_models() (best-effort).
+        """Replace _seen_models[engine.key] with the current available_models().
 
-        Called after an engine becomes the active one.  Never raises: if the
-        query fails or returns nothing the existing set is left unchanged."""
+        Called after an engine becomes the active one.  Replaces (not unions)
+        the stored set so that a deleted or renamed model drops out of discovery
+        on the next snapshot.  Never raises: if the query fails or returns
+        nothing the existing set is left unchanged."""
         try:
             ids = await engine.available_models()
         except Exception:  # noqa: BLE001
             return
         if ids:
-            self._seen_models.setdefault(engine.key, set()).update(ids)
+            self._seen_models[engine.key] = set(ids)
             self._persist()
 
     def _discovered_index(self) -> dict[str, str]:
@@ -1433,8 +1490,11 @@ class EngineManager:
         log.info("SWAP done: %s -> %s in %.1fs", prev, target.key, dt)
         # Best-effort: remember what models the newly-active engine serves so
         # that down-engine discovery can route future requests to it.  Must not
-        # raise or block subsequent in-flight accounting.
-        asyncio.ensure_future(self._snapshot_seen_models(target))
+        # raise or block subsequent in-flight accounting.  Only scheduled when
+        # discovery is enabled so that the behaviour when discover.enabled is
+        # False is byte-identical to the pre-discovery code.
+        if self.cfg.discover.enabled:
+            asyncio.ensure_future(self._snapshot_seen_models(target))
 
     @staticmethod
     def _read_mem_available_kb() -> int | None:
@@ -1551,16 +1611,17 @@ class EngineManager:
     def _persist(self) -> None:
         try:
             os.makedirs(os.path.dirname(self.cfg.state_file), exist_ok=True)
+            state: dict[str, Any] = {
+                "active_engine": self.active_engine,
+                "last_swap": self._last_swap,
+            }
+            # Only write the seen_models key when discovery is enabled so that
+            # the state file is byte-identical to before when discovery is off.
+            if self.cfg.discover.enabled:
+                state["seen_models"] = {
+                    k: sorted(v) for k, v in self._seen_models.items() if v
+                }
             with open(self.cfg.state_file, "w") as fh:
-                json.dump(
-                    {
-                        "active_engine": self.active_engine,
-                        "last_swap": self._last_swap,
-                        "seen_models": {
-                            k: sorted(v) for k, v in self._seen_models.items() if v
-                        },
-                    },
-                    fh,
-                )
+                json.dump(state, fh)
         except OSError as exc:  # pragma: no cover - best effort
             log.debug("could not persist state: %s", exc)
