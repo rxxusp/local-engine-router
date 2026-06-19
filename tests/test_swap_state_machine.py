@@ -3,16 +3,21 @@
 The headline differentiator: strict mutual exclusion between heavy engines, with
 in-flight accounting, draining, and metrics. All engines here are in-memory
 FakeEngines (no sockets, instant), so timing is deterministic.
+
+Also covers the discovery-adjacent persistence helpers added in Slice 3:
+_seen_models seeding from a state file and the post-swap snapshot task.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import tempfile
 
 import pytest
 
 from router import metrics
-from router.config import ModelSpec
+from router.config import DiscoverConfig, ModelSpec
 from router.engines import EngineError
 
 from conftest import FakeEngine, make_config, make_manager_with_fakes
@@ -284,3 +289,87 @@ async def test_in_flight_at_swap_start_metric_recorded():
     assert "in_flight_at_swap_start_count" in text
     # The histogram observed at least one sample.
     assert "in_flight_at_swap_start_count 1" in text
+
+
+# --------------------------------------------------------------------------- #
+# _seen_models persistence (Slice 3: discovery helpers)
+# --------------------------------------------------------------------------- #
+async def test_seen_models_seeded_from_state_file():
+    """_seen_models is pre-populated from a state file that has a seen_models key."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False
+    ) as fh:
+        json.dump(
+            {
+                "active_engine": None,
+                "last_swap": {},
+                "seen_models": {"ds4": ["ds4-loaded-model", "ds4-other"]},
+            },
+            fh,
+        )
+        state_path = fh.name
+
+    models = [ModelSpec(id="m-ds4", engine="ds4", display_name="d")]
+    cfg = make_config(models=models, state_file=state_path)
+    fakes = {"ds4": FakeEngine("ds4")}
+    mgr = make_manager_with_fakes(fakes, cfg=cfg)
+    # The state file is read in __init__ via _load_seen_models_from_state.
+    assert "ds4-loaded-model" in mgr._seen_models.get("ds4", set())
+    assert "ds4-other" in mgr._seen_models.get("ds4", set())
+
+
+async def test_seen_models_missing_state_file_is_noop():
+    """A missing state file does not crash and _seen_models stays empty."""
+    models = [ModelSpec(id="m-ds4", engine="ds4", display_name="d")]
+    cfg = make_config(models=models, state_file="/tmp/does-not-exist-ler-test.json")
+    fakes = {"ds4": FakeEngine("ds4")}
+    mgr = make_manager_with_fakes(fakes, cfg=cfg)
+    assert mgr._seen_models.get("ds4", set()) == set()
+
+
+async def test_persist_writes_seen_models():
+    """_persist() includes seen_models in the written state."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False
+    ) as fh:
+        state_path = fh.name
+
+    models = [ModelSpec(id="m-ds4", engine="ds4", display_name="d")]
+    cfg = make_config(models=models, state_file=state_path)
+    fakes = {"ds4": FakeEngine("ds4")}
+    mgr = make_manager_with_fakes(fakes, cfg=cfg)
+    mgr._seen_models["ds4"] = {"model-alpha", "model-beta"}
+    mgr._persist()
+
+    with open(state_path) as fh:
+        data = json.load(fh)
+
+    assert "seen_models" in data
+    assert set(data["seen_models"].get("ds4", [])) == {"model-alpha", "model-beta"}
+
+
+async def test_snapshot_seen_models_updates_after_swap():
+    """After a successful swap, _seen_models for the target engine is updated.
+
+    We give the target FakeEngine an available_models() override that returns
+    a known set, then run a swap and give the background task a tick to complete.
+    """
+    class _ModelReturningEngine(FakeEngine):
+        async def available_models(self) -> set[str]:
+            return {"snapped-model-a", "snapped-model-b"}
+
+    models = [
+        ModelSpec(id="m-ds4", engine="ds4", display_name="d"),
+        ModelSpec(id="m-oll", engine="ollama", display_name="o"),
+    ]
+    cfg = make_config(models=models)
+    fakes = {
+        "ds4": _ModelReturningEngine("ds4"),
+        "ollama": FakeEngine("ollama"),
+    }
+    mgr = make_manager_with_fakes(fakes, cfg=cfg)
+    await mgr.acquire("m-ds4")
+    # Give the asyncio.ensure_future snapshot task a chance to run.
+    await asyncio.sleep(0)
+    assert "snapped-model-a" in mgr._seen_models.get("ds4", set())
+    assert "snapped-model-b" in mgr._seen_models.get("ds4", set())
