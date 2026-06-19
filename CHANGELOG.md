@@ -41,13 +41,13 @@ configs keep working unchanged.
 - **Tag-triggered PyPI publish workflow** (`.github/workflows/pypi-publish.yml`).
   On a `v*` tag it asserts the tag matches the package version, builds an sdist
   and wheel, and publishes to PyPI via Trusted Publishing (OIDC, no stored
-  token). It is gated behind the `ENABLE_PYPI_PUBLISH` repository variable so it
-  stays dormant until a maintainer opts in; see the README install section for
-  the one-time PyPI setup.
+  token). It is gated behind the `ENABLE_PYPI_PUBLISH` repository variable, which
+  a maintainer sets to enable publishing. This workflow published 0.5.0 to PyPI,
+  so `pip install local-engine-router` works.
 
 ### Changed
 - **README rewritten around a friendly Install / Quickstart** near the top with
-  three pick-your-path options (one-line script, pip/pipx, Docker), the `init`
+  three pick-your-path options (pip/pipx, one-line script, Docker), the `init`
   wizard, and a first curl request, aiming for under five minutes to a working
   router. The deeper docs (swap mechanic, engine types, presets, auto-discovery,
   sharp edges) are unchanged below it.
