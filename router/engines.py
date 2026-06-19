@@ -208,6 +208,14 @@ class Engine:
     async def free_vram(self) -> None:  # pragma: no cover - overridden
         raise NotImplementedError
 
+    async def available_models(self) -> set[str]:
+        """Return the set of model ids this engine can serve.
+
+        Default implementation returns an empty set so existing callers that
+        do not need this capability are unaffected. Subclasses that know their
+        live model catalogue override this."""
+        return set()
+
     async def wait_ready(self, timeout_s: float, interval_s: float = 1.5) -> bool:
         """Poll is_ready() until it returns True or *timeout_s* elapses."""
         loop = asyncio.get_running_loop()
@@ -441,6 +449,7 @@ class GenericProcessEngine(Engine):
         self.cfg = cfg
         self.base_url = (cfg.base_url or "").rstrip("/")
         self._proc: subprocess.Popen | None = None
+        self._models_cache: tuple[float, set[str]] | None = None
 
     # -- readiness ------------------------------------------------------- #
     async def is_ready(self) -> bool:
@@ -666,6 +675,52 @@ class GenericProcessEngine(Engine):
         except (httpx.HTTPError, OSError):
             return False
 
+    # -- available models (for auto-detect) -------------------------------- #
+    async def available_models(self) -> set[str]:
+        """Return the set of model ids reported by the engine's model-list endpoint.
+
+        Only queries the engine when it is already up (is_ready() == True).
+        Results are TTL-cached exactly like APISwapEngine.available_tags. On
+        not-ready, HTTP error, or parse failure the method returns an empty set
+        (best-effort: never raises, never starts the engine).
+
+        The model list is fetched from base_url + /v1/models (the standard
+        OpenAI endpoint). ready_path is used only by is_ready() and is not
+        repurposed here. Parses the OpenAI /v1/models response shape (data[].id).
+        Uses getattr with a 30.0 default for tags_cache_ttl_s because that
+        config field may not yet exist on the cfg object (added by a parallel
+        slice).
+        """
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        ttl = getattr(self.cfg, "tags_cache_ttl_s", 30.0)
+        if self._models_cache and now - self._models_cache[0] < ttl:
+            return self._models_cache[1]
+        if not await self.is_ready():
+            return set()
+        # Always use the standard OpenAI model-list endpoint. The ready_path
+        # is used only as the liveness probe in is_ready(); the model catalogue
+        # lives at /v1/models on every engine this class covers (vLLM, SGLang,
+        # llamafile, Aphrodite).
+        try:
+            r = await self._ctl.get(self.base_url + "/v1/models")
+            if r.status_code != 200:
+                return set()
+            data = r.json()
+        except (httpx.HTTPError, OSError, ValueError):
+            return set()
+        try:
+            ids: set[str] = set()
+            for entry in data.get("data", []) or []:
+                if isinstance(entry, dict):
+                    model_id = entry.get("id")
+                    if isinstance(model_id, str) and model_id:
+                        ids.add(model_id)
+        except (AttributeError, TypeError):
+            return set()
+        self._models_cache = (now, ids)
+        return ids
+
 
 class APISwapEngine(Engine):
     """An engine whose models are loaded/unloaded over HTTP (no owned process).
@@ -881,6 +936,13 @@ class APISwapEngine(Engine):
         tags = set(await self.loaded_model_names())
         self._tags_cache = (now, tags)
         return tags
+
+    async def available_models(self) -> set[str]:
+        """Return the set of model ids this engine can serve.
+
+        Delegates to available_tags() so OllamaEngine (which overrides
+        available_tags with /api/tags) also benefits automatically."""
+        return await self.available_tags()
 
 
 class OllamaEngine(APISwapEngine):
