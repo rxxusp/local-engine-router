@@ -213,6 +213,22 @@ def cmd_logs(_args: argparse.Namespace) -> None:
             sys.exit(1)
 
 
+def cmd_discover(_args: argparse.Namespace) -> None:
+    """POST /admin/discover and print per-engine discovered model ids."""
+    result = _post("/admin/discover", {})
+    engines = result.get("engines") or {}
+    if not engines:
+        print("(no engines reported)")
+        return
+    for engine_key, model_ids in sorted(engines.items()):
+        print(f"[{engine_key}]")
+        if model_ids:
+            for mid in model_ids:
+                print(f"  {mid}")
+        else:
+            print("  (none)")
+
+
 def cmd_service(args: argparse.Namespace) -> None:
     action = args.action
     # The router is a *user* unit, so no sudo and the --user flag.
@@ -242,6 +258,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="show active engine and in-flight counts")
     sub.add_parser("models", help="list all known models (id, engine, name)")
+    sub.add_parser("discover", help="scan all engines for discoverable models (POST /admin/discover)")
     sub.add_parser("health", help="check router liveness (GET /health)")
     sub.add_parser("logs", help="tail the router log (journalctl or file fallback)")
 
@@ -271,6 +288,8 @@ def main() -> None:
         cmd_status(args)
     elif cmd == "models":
         cmd_models(args)
+    elif cmd == "discover":
+        cmd_discover(args)
     elif cmd == "use":
         cmd_use(args)
     elif cmd == "health":

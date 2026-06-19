@@ -302,7 +302,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         return HTMLResponse(html)
 
     # -----------------------------------------------------------------------
-    # /v1/models — union of static config + live ollama tags (no swap)
+    # /v1/models — union of static config + live tags from all engines (no swap)
     # -----------------------------------------------------------------------
 
     @app.get("/v1/models")
@@ -311,7 +311,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         seen: set[str] = set()
         data: list[dict[str, Any]] = []
 
-        # Static registry first.
+        # Static registry first (with context_length, which only the config knows).
         for spec in cfg.models:
             seen.add(spec.id)
             data.append(
@@ -325,27 +325,81 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 }
             )
 
-        # Live Ollama tags (best-effort; don't fail if ollama is down).
-        ollama_engine = _find_ollama_engine(manager)
-        if ollama_engine is not None:
+        # Live tags from every engine — best-effort, one try/except per engine
+        # so a single slow or broken engine cannot fail the whole listing.
+        for engine_key, engine in manager.engines.items():
             try:
-                tags = await ollama_engine.available_tags()
-                for tag in sorted(tags):
-                    if tag not in seen:
-                        seen.add(tag)
-                        data.append(
-                            {
-                                "id": tag,
-                                "object": "model",
-                                "created": _MODELS_CREATED_TS,
-                                "owned_by": ollama_engine.key,
-                                "name": tag,
-                            }
-                        )
+                tags = await engine.available_models()
             except Exception as exc:  # noqa: BLE001
-                log.warning("could not fetch ollama tags for /v1/models: %s", exc)
+                log.warning("could not fetch models from engine %r for /v1/models: %s",
+                            engine_key, exc)
+                continue
+            for tag in sorted(tags):
+                if tag not in seen:
+                    seen.add(tag)
+                    data.append(
+                        {
+                            "id": tag,
+                            "object": "model",
+                            "created": _MODELS_CREATED_TS,
+                            "owned_by": engine_key,
+                            "name": tag,
+                        }
+                    )
+
+        # Surface any stopped-engine discovered ids when the routing slice has
+        # populated a _discovered_index on the manager (hasattr guard so this
+        # slice works standalone today and picks up the index after integration).
+        disc = manager._discovered_index() if hasattr(manager, "_discovered_index") else {}
+        for model_id, engine_key in disc.items():
+            if model_id not in seen:
+                seen.add(model_id)
+                data.append(
+                    {
+                        "id": model_id,
+                        "object": "model",
+                        "created": _MODELS_CREATED_TS,
+                        "owned_by": engine_key,
+                        "name": model_id,
+                    }
+                )
 
         return JSONResponse({"object": "list", "data": data})
+
+    # -----------------------------------------------------------------------
+    # Admin: trigger discovery scan — returns per-engine model lists
+    # -----------------------------------------------------------------------
+
+    @app.post("/admin/discover")
+    async def admin_discover(request: Request) -> JSONResponse:
+        """Return a per-engine summary of discoverable model ids.
+
+        Calls available_models() on every engine (best-effort, one try/except
+        per engine). Also merges in the stopped-engine map from
+        manager._discovered_index() when the routing slice has populated it.
+        Auth-gated identically to /admin/swap.
+        """
+        manager: EngineManager = request.app.state.manager
+        engines_out: dict[str, list[str]] = {}
+
+        for engine_key, engine in manager.engines.items():
+            try:
+                ids = await engine.available_models()
+                engines_out[engine_key] = sorted(ids)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("discover: engine %r available_models failed: %s",
+                            engine_key, exc)
+                engines_out[engine_key] = []
+
+        # Merge in any stopped-engine entries from the routing slice's index.
+        disc = manager._discovered_index() if hasattr(manager, "_discovered_index") else {}
+        for model_id, engine_key in disc.items():
+            bucket = engines_out.setdefault(engine_key, [])
+            if model_id not in bucket:
+                bucket.append(model_id)
+                bucket.sort()
+
+        return JSONResponse({"engines": engines_out})
 
     # -----------------------------------------------------------------------
     # Admin: force swap

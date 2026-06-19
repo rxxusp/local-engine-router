@@ -14,13 +14,17 @@ run lifespan events), which is what populates app.state.manager / app.state.clie
 
 from __future__ import annotations
 
+import argparse
 import contextlib
+import json
+import urllib.request
 
 import httpx
 
 from router import metrics
 from router.app import create_app
 from router.config import Ds4Config, ModelSpec, OllamaConfig, RouterConfig
+import router.cli as cli
 
 
 def _app_config(mock_base: str, *, api_keys=None, aliases=None) -> RouterConfig:
@@ -404,3 +408,296 @@ async def test_non_destructive_catchall_still_passes_through(mock_upstream):
     async with _client_for(_app_config(mock_upstream.base_url)) as (client, _):
         r = await client.get("/api/some-future-endpoint")
         assert r.status_code != 403
+
+
+# --------------------------------------------------------------------------- #
+# Slice 4: /v1/models union from multiple engines' available_models()
+# --------------------------------------------------------------------------- #
+
+class _FakeDiscoverEngine:
+    """Minimal fake engine that returns a fixed set from available_models().
+
+    Defined locally so this file stays hermetic (does not edit conftest.py).
+    Only the attributes and methods used by list_models / admin_discover are
+    needed: key, base_url, available_models(), and aclose() so manager teardown
+    works.
+    """
+
+    def __init__(self, key: str, models: set[str]) -> None:
+        self.key = key
+        self.base_url = f"http://fake-{key}.local"
+        self._models = set(models)
+
+    async def available_models(self) -> set[str]:
+        return set(self._models)
+
+    async def aclose(self) -> None:
+        pass
+
+
+async def test_v1_models_unions_multiple_engines(mock_upstream):
+    """GET /v1/models: static models first, then all engines' available_models()."""
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+        # Inject two fake engines alongside the real ones.
+        manager.engines["fake-a"] = _FakeDiscoverEngine("fake-a", {"model-a1", "model-a2"})
+        manager.engines["fake-b"] = _FakeDiscoverEngine("fake-b", {"model-b1"})
+        manager._inflight["fake-a"] = 0
+        manager._inflight["fake-b"] = 0
+
+        r = await client.get("/v1/models")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["object"] == "list"
+        ids = {m["id"] for m in data["data"]}
+
+        # Static config entries must be present.
+        assert "deepseek-v4-flash" in ids
+        assert "qwen2.5:3b" in ids
+        # The fake engines' discovered models must appear.
+        assert "model-a1" in ids
+        assert "model-a2" in ids
+        assert "model-b1" in ids
+        # Each discovered entry carries owned_by matching the engine key.
+        for entry in data["data"]:
+            if entry["id"] == "model-a1":
+                assert entry["owned_by"] == "fake-a"
+            if entry["id"] == "model-b1":
+                assert entry["owned_by"] == "fake-b"
+
+
+async def test_v1_models_deduplicates_across_engines(mock_upstream):
+    """An id present in static config is NOT duplicated by an engine returning it."""
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+        # Return "deepseek-v4-flash" (already in static config) from a fake engine.
+        manager.engines["fake-dup"] = _FakeDiscoverEngine(
+            "fake-dup", {"deepseek-v4-flash", "extra-model"}
+        )
+        manager._inflight["fake-dup"] = 0
+
+        r = await client.get("/v1/models")
+        assert r.status_code == 200
+        ids = [m["id"] for m in r.json()["data"]]
+        # "deepseek-v4-flash" must appear exactly once.
+        assert ids.count("deepseek-v4-flash") == 1
+        # The non-duplicate still appears.
+        assert "extra-model" in ids
+
+
+async def test_v1_models_best_effort_skips_broken_engine(mock_upstream):
+    """A single broken engine must not prevent the rest from being listed."""
+
+    class _BrokenEngine:
+        key = "broken"
+        base_url = "http://broken.local"
+
+        async def available_models(self) -> set[str]:
+            raise RuntimeError("simulated failure")
+
+        async def aclose(self) -> None:
+            pass
+
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+        manager.engines["broken"] = _BrokenEngine()
+        manager.engines["good"] = _FakeDiscoverEngine("good", {"good-model"})
+        manager._inflight["broken"] = 0
+        manager._inflight["good"] = 0
+
+        r = await client.get("/v1/models")
+        assert r.status_code == 200
+        ids = {m["id"] for m in r.json()["data"]}
+        # The good engine's model still appears.
+        assert "good-model" in ids
+
+
+async def test_v1_models_discovered_index_surfaced_when_present(mock_upstream):
+    """When manager has _discovered_index(), its stopped-engine models appear."""
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+        # Simulate the routing slice providing _discovered_index.
+        manager._discovered_index = lambda: {"stopped-model": "some-engine"}
+
+        r = await client.get("/v1/models")
+        assert r.status_code == 200
+        ids = {m["id"] for m in r.json()["data"]}
+        assert "stopped-model" in ids
+
+    # Restore: remove the injected method (no-op for other tests since each
+    # test gets its own manager via _client_for).
+
+
+# --------------------------------------------------------------------------- #
+# Slice 4: POST /admin/discover
+# --------------------------------------------------------------------------- #
+
+async def test_admin_discover_returns_per_engine_summary(mock_upstream):
+    """POST /admin/discover must return {"engines": {key: [model ids...]}}."""
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+        manager.engines["fake-x"] = _FakeDiscoverEngine("fake-x", {"mx1", "mx2"})
+        manager._inflight["fake-x"] = 0
+
+        r = await client.post("/admin/discover", json={})
+        assert r.status_code == 200
+        body = r.json()
+        assert "engines" in body
+        engines = body["engines"]
+        # Our fake engine must be present with its models sorted.
+        assert "fake-x" in engines
+        assert sorted(engines["fake-x"]) == ["mx1", "mx2"]
+
+
+async def test_admin_discover_best_effort_broken_engine(mock_upstream):
+    """A broken engine must not cause /admin/discover to 500; its entry is []."""
+
+    class _BrokenEngine:
+        key = "broken-disc"
+        base_url = "http://broken-disc.local"
+
+        async def available_models(self) -> set[str]:
+            raise OSError("boom")
+
+        async def aclose(self) -> None:
+            pass
+
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+        manager.engines["broken-disc"] = _BrokenEngine()
+        manager.engines["good-disc"] = _FakeDiscoverEngine("good-disc", {"gd1"})
+        manager._inflight["broken-disc"] = 0
+        manager._inflight["good-disc"] = 0
+
+        r = await client.post("/admin/discover", json={})
+        assert r.status_code == 200
+        body = r.json()
+        # Broken engine yields an empty list, not an error.
+        assert body["engines"].get("broken-disc") == []
+        # Good engine still appears correctly.
+        assert body["engines"].get("good-disc") == ["gd1"]
+
+
+async def test_admin_discover_merges_discovered_index(mock_upstream):
+    """When _discovered_index is present, its entries appear in /admin/discover."""
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+        manager._discovered_index = lambda: {"offline-model": "offline-engine"}
+
+        r = await client.post("/admin/discover", json={})
+        assert r.status_code == 200
+        body = r.json()
+        engines = body["engines"]
+        assert "offline-model" in engines.get("offline-engine", [])
+
+
+async def test_admin_discover_no_discovered_index_guard(mock_upstream):
+    """Without _discovered_index on manager, /admin/discover still works."""
+    async with _client_for(_app_config(mock_upstream.base_url)) as (client, manager):
+        # Ensure the attribute is absent (it shouldn't be set by default).
+        if hasattr(manager, "_discovered_index"):
+            del manager._discovered_index  # type: ignore[attr-defined]
+
+        r = await client.post("/admin/discover", json={})
+        assert r.status_code == 200
+        assert "engines" in r.json()
+
+
+async def test_admin_discover_gated_by_auth(mock_upstream):
+    """POST /admin/discover must require an API key when auth is enabled."""
+    cfg = _app_config(mock_upstream.base_url, api_keys=[API_KEY])
+    async with _client_for(cfg) as (client, _):
+        # No key -> 401.
+        r = await client.post("/admin/discover", json={})
+        assert r.status_code == 401
+
+        # Correct key -> 200.
+        r = await client.post(
+            "/admin/discover",
+            json={},
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
+        assert r.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Slice 4: routerctl discover subcommand
+# --------------------------------------------------------------------------- #
+
+class _FakeDiscoverResponse:
+    """Minimal urllib-compatible response for /admin/discover."""
+
+    def __init__(self, body: dict) -> None:
+        self._data = json.dumps(body).encode()
+
+    def read(self) -> bytes:
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+
+_DISCOVER_PAYLOAD = {
+    "engines": {
+        "ds4": ["deepseek-v4-flash"],
+        "ollama": ["qwen3:3b", "llama3:8b"],
+    }
+}
+
+
+class TestCmdDiscover:
+    def test_parser_recognises_discover(self):
+        args = cli.build_parser().parse_args(["discover"])
+        assert args.command == "discover"
+
+    def test_cmd_discover_posts_to_admin_discover(self, monkeypatch):
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return _FakeDiscoverResponse(_DISCOVER_PAYLOAD)
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        cli.cmd_discover(argparse.Namespace())
+
+        assert len(captured) == 1
+        assert captured[0].full_url.endswith("/admin/discover")
+        assert captured[0].method == "POST"
+
+    def test_cmd_discover_prints_engine_headers(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            urllib.request, "urlopen",
+            lambda req, timeout=None: _FakeDiscoverResponse(_DISCOVER_PAYLOAD),
+        )
+        cli.cmd_discover(argparse.Namespace())
+        out = capsys.readouterr().out
+        assert "[ds4]" in out
+        assert "[ollama]" in out
+
+    def test_cmd_discover_prints_model_ids(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            urllib.request, "urlopen",
+            lambda req, timeout=None: _FakeDiscoverResponse(_DISCOVER_PAYLOAD),
+        )
+        cli.cmd_discover(argparse.Namespace())
+        out = capsys.readouterr().out
+        assert "deepseek-v4-flash" in out
+        assert "qwen3:3b" in out
+        assert "llama3:8b" in out
+
+    def test_main_discover_dispatches(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            urllib.request, "urlopen",
+            lambda req, timeout=None: _FakeDiscoverResponse(_DISCOVER_PAYLOAD),
+        )
+        import sys
+        monkeypatch.setattr(sys, "argv", ["routerctl", "discover"])
+        cli.main()
+        out = capsys.readouterr().out
+        assert "[ds4]" in out
+
+    def test_cmd_discover_empty_result(self, monkeypatch, capsys):
+        """An empty engines dict must produce a sensible message, not a crash."""
+        monkeypatch.setattr(
+            urllib.request, "urlopen",
+            lambda req, timeout=None: _FakeDiscoverResponse({"engines": {}}),
+        )
+        cli.cmd_discover(argparse.Namespace())
+        out = capsys.readouterr().out
+        assert "none" in out.lower() or out.strip() != ""
