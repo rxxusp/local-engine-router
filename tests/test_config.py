@@ -22,11 +22,11 @@ from router.config import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-# A live deployment's config.yaml is gitignored; fall back to the shipped
-# example so this test also runs on a fresh clone / CI.
-REAL_CONFIG = REPO_ROOT / "config.yaml"
-if not REAL_CONFIG.exists():
-    REAL_CONFIG = REPO_ROOT / "config.example.yaml"
+# Always load the shipped example config: a live deployment's config.yaml is
+# gitignored and carries deployment-specific engine/model ids, so this test
+# pins to config.example.yaml to stay deterministic on a fresh clone, in CI,
+# and on a developer machine that has a customized config.yaml.
+REAL_CONFIG = REPO_ROOT / "config.example.yaml"
 
 
 def _write(tmp_path, text: str) -> str:
@@ -36,6 +36,7 @@ def _write(tmp_path, text: str) -> str:
 
 
 def test_load_real_config_yaml():
+    """The shipped config.example.yaml loads and validates end to end."""
     cfg = load_config(str(REAL_CONFIG))
     assert cfg.port == 8077
     # The shipped example uses the generic engines: table (llama.cpp + Ollama).
