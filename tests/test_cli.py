@@ -18,10 +18,9 @@ import io
 import json
 import subprocess
 import sys
-import types
 import urllib.error
 import urllib.request
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -443,6 +442,7 @@ class TestCmdLogs:
 
         def fake_run(cmd, **kw):
             captured.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0)
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         args = argparse.Namespace()

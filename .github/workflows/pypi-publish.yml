@@ -82,6 +82,9 @@ jobs:
 
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
-        # To use an API token instead of Trusted Publishing, uncomment:
-        # with:
+        with:
+          # A release published for an already-pushed tag fires both triggers;
+          # let the second run no-op instead of failing on the duplicate upload.
+          skip-existing: true
+        # To use an API token instead of Trusted Publishing, add:
         #   password: ${{ secrets.PYPI_API_TOKEN }}

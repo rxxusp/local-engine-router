@@ -647,6 +647,13 @@ def load_config(path: str) -> RouterConfig:
         for k, v in raw.items()
         if k in RouterConfig.__dataclass_fields__ and k not in skip
     }
+    # An explicit empty `aliases:` / `api_keys:` key is YAML null; normalize to
+    # the empty container so runtime code can rely on the declared types
+    # (engines.py calls cfg.aliases.get() on every request).
+    if top.get("aliases", ...) is None:
+        top["aliases"] = {}
+    if top.get("api_keys", ...) is None:
+        top["api_keys"] = []
     cfg = RouterConfig(
         ds4=ds4, ollama=ollama, engines=engines, models=models,
         discover=discover, **top
@@ -947,7 +954,9 @@ def configure_logging(cfg: RouterConfig) -> None:
     root.addHandler(stream)
 
     try:
-        os.makedirs(os.path.dirname(cfg.log_file), exist_ok=True)
+        log_dir = os.path.dirname(cfg.log_file)
+        if log_dir:  # bare filename => cwd; makedirs("") raises FileNotFoundError
+            os.makedirs(log_dir, exist_ok=True)
         fileh = logging.handlers.RotatingFileHandler(
             cfg.log_file, maxBytes=5_000_000, backupCount=3
         )

@@ -14,7 +14,7 @@ import os
 import pytest
 
 from router import wizard
-from router.config import ConfigError, load_config
+from router.config import load_config
 
 
 # --------------------------------------------------------------------------- #

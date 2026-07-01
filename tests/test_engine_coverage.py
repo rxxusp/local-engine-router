@@ -29,7 +29,6 @@ from router.config import (
     ApiSwapConfig,
     GenericProcessConfig,
     ModelSpec,
-    RouterConfig,
 )
 from router.engines import (
     APISwapEngine,

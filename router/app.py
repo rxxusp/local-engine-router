@@ -36,6 +36,7 @@ import asyncio
 import hmac
 import json
 import logging
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -95,7 +96,13 @@ def _extract_api_key(headers) -> str | None:
 
 def _api_key_valid(provided: str, keys: list[str]) -> bool:
     """Constant-time membership check against the configured keys."""
-    return any(hmac.compare_digest(provided, k) for k in keys)
+    # Compare bytes: compare_digest raises TypeError on non-ASCII str inputs,
+    # and header values can carry any latin-1 byte.
+    provided_b = provided.encode("utf-8", errors="surrogateescape")
+    return any(
+        hmac.compare_digest(provided_b, k.encode("utf-8", errors="surrogateescape"))
+        for k in keys
+    )
 
 
 def _error_status_for(exc: Exception) -> int:
@@ -442,6 +449,11 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 _openai_error("request body must be JSON", "invalid_request_error"),
                 status_code=400,
             )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                _openai_error("request body must be a JSON object", "invalid_request_error"),
+                status_code=400,
+            )
 
         model_id: str | None = body.get("model")
         engine_key: str | None = body.get("engine")
@@ -490,6 +502,12 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 _openai_error("request body is not valid JSON", "invalid_request_error"),
                 status_code=400,
             )
+        if not isinstance(body, dict):
+            # "hi", [1,2] and 42 are valid JSON; .get() on them would 500.
+            return JSONResponse(
+                _openai_error("request body must be a JSON object", "invalid_request_error"),
+                status_code=400,
+            )
 
         model: str | None = body.get("model")
         if not model:
@@ -512,7 +530,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
 
         if is_stream:
             # SSE streaming with keep-alive comment injection during swaps.
-            async def gen() -> "AsyncGenerator[bytes, None]":  # type: ignore[name-defined]
+            async def gen() -> AsyncGenerator[bytes, None]:
                 acq = asyncio.create_task(manager.acquire(model))
                 engine = None
                 try:
@@ -552,11 +570,29 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                         return
 
                     log.info("stream %s -> %s", model, engine.key)
-                    url = upstream_url(engine.base_url, path)
+                    url = upstream_url(engine.base_url, path, request.url.query)
                     try:
                         async with client.stream(
                             request.method, url, content=raw_body, headers=fwd_headers
                         ) as up:
+                            if up.status_code >= 400:
+                                # The 200 SSE response has already started, so we
+                                # can't change the status — but silently relaying
+                                # the upstream's JSON error body as if it were SSE
+                                # would leave clients hanging on unparseable bytes.
+                                # Surface it as a framed error chunk instead.
+                                err_body = (await up.aread()).decode(errors="replace")
+                                log.error(
+                                    "upstream %s returned %d on stream: %s",
+                                    url, up.status_code, err_body[:500],
+                                )
+                                yield sse_error_chunk(
+                                    RuntimeError(
+                                        f"upstream returned {up.status_code}: {err_body[:500]}"
+                                    )
+                                )
+                                yield b"data: [DONE]\n\n"
+                                return
                             async for chunk in up.aiter_raw():
                                 # Stop pulling from upstream the moment the client
                                 # disconnects. Breaking exits the client.stream()
@@ -617,7 +653,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 return JSONResponse(_openai_error(str(exc), "engine_error"), status_code=status)
 
             log.info("request %s -> %s", model, engine.key)
-            url = upstream_url(engine.base_url, path)
+            url = upstream_url(engine.base_url, path, request.url.query)
             try:
                 status, resp_headers, body_bytes = await forward(
                     client, request.method, url, fwd_headers, raw_body
@@ -674,6 +710,12 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 _openai_error("request body is not valid JSON", "invalid_request_error"),
                 status_code=400,
             )
+        if not isinstance(body, dict):
+            # "hi", [1,2] and 42 are valid JSON; .get() on them would 500.
+            return JSONResponse(
+                _openai_error("request body must be a JSON object", "invalid_request_error"),
+                status_code=400,
+            )
 
         model: str | None = body.get("model")
         if not model:
@@ -703,7 +745,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
             #
             # This mirrors the shielded-acquire + finally-release pattern proven
             # in _handle_v1_post's gen(), including its cancellation/leak-safety.
-            async def ndjson_gen() -> "AsyncGenerator[bytes, None]":  # type: ignore[name-defined]
+            async def ndjson_gen() -> AsyncGenerator[bytes, None]:
                 acq = asyncio.create_task(manager.acquire(model))
                 engine = None
                 try:
@@ -743,11 +785,24 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                         return
 
                     log.info("api stream %s -> %s", model, engine.key)
-                    url = upstream_url(engine.base_url, path)
+                    url = upstream_url(engine.base_url, path, request.url.query)
                     try:
                         async with client.stream(
                             request.method, url, content=raw_body, headers=fwd_headers
                         ) as up:
+                            if up.status_code >= 400:
+                                # The 200 NDJSON response has already started; relay
+                                # the upstream error as an Ollama-style error line
+                                # rather than masking it as a silent empty stream.
+                                err_body = (await up.aread()).decode(errors="replace")
+                                log.error(
+                                    "upstream %s returned %d on stream: %s",
+                                    url, up.status_code, err_body[:500],
+                                )
+                                yield json.dumps(
+                                    {"error": f"upstream returned {up.status_code}: {err_body[:500]}"}
+                                ).encode() + b"\n"
+                                return
                             async for chunk in up.aiter_raw():
                                 # Abort the upstream pull when the client
                                 # disconnects so the engine stops generating into
@@ -801,7 +856,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 return JSONResponse(_openai_error(str(exc), "engine_error"), status_code=status)
 
             log.info("api request %s -> %s (stream=False)", model, engine.key)
-            url = upstream_url(engine.base_url, path)
+            url = upstream_url(engine.base_url, path, request.url.query)
             try:
                 status, resp_headers, body_bytes = await forward(
                     client, request.method, url, fwd_headers, raw_body
@@ -851,7 +906,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
 
         raw_body = await request.body()
         fwd_headers = _build_fwd_headers(request)
-        url = upstream_url(ollama_engine.base_url, path)
+        url = upstream_url(ollama_engine.base_url, path, request.url.query)
 
         try:
             status, resp_headers, body_bytes = await forward(
@@ -886,7 +941,44 @@ def create_app(cfg: RouterConfig) -> FastAPI:
 
     @app.post("/api/pull")
     async def api_pull(request: Request) -> Response:
-        return await _passthrough_to_ollama(request, "/api/pull")
+        # /api/pull streams NDJSON progress for minutes on a large model; the
+        # buffering forward() would return zero bytes until the pull finishes
+        # and time out every Ollama client. Relay it as a live stream instead.
+        manager: EngineManager = request.app.state.manager
+        client: httpx.AsyncClient = request.app.state.client
+
+        ollama_engine = _find_ollama_engine(manager)
+        if ollama_engine is None:
+            return JSONResponse(
+                _openai_error("ollama engine is disabled", "engine_error"),
+                status_code=503,
+            )
+
+        raw_body = await request.body()
+        fwd_headers = _build_fwd_headers(request)
+        url = upstream_url(ollama_engine.base_url, "/api/pull", request.url.query)
+
+        async def pull_gen() -> AsyncGenerator[bytes, None]:
+            try:
+                async with client.stream(
+                    "POST", url, content=raw_body, headers=fwd_headers
+                ) as up:
+                    if up.status_code >= 400:
+                        err_body = (await up.aread()).decode(errors="replace")
+                        log.warning("ollama pull error on %s: %s", url, err_body[:500])
+                        yield json.dumps(
+                            {"error": f"upstream returned {up.status_code}: {err_body[:500]}"}
+                        ).encode() + b"\n"
+                        return
+                    async for chunk in up.aiter_raw():
+                        if await request.is_disconnected():
+                            break
+                        yield chunk
+            except httpx.HTTPError as exc:
+                log.warning("ollama pull error on %s: %s", url, exc)
+                yield json.dumps({"error": str(exc)}).encode() + b"\n"
+
+        return StreamingResponse(pull_gen(), media_type="application/x-ndjson")
 
     # Catch-all for any other /api/* paths not handled above — passthrough
     # to ollama without swap (management endpoints). Destructive endpoints are

@@ -23,7 +23,6 @@ import pytest
 
 import router.sysmem as sysmem
 from router.engines import EngineManager
-from router.config import RouterConfig
 
 from conftest import make_config, make_manager_with_fakes, FakeEngine
 

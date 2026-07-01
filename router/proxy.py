@@ -90,9 +90,13 @@ def make_client(cfg: RouterConfig) -> httpx.AsyncClient:
 # URL builder
 # ---------------------------------------------------------------------------
 
-def upstream_url(base_url: str, path: str) -> str:
-    """Concatenate *base_url* (no trailing slash) with *path* (leading slash)."""
-    return base_url.rstrip("/") + path
+def upstream_url(base_url: str, path: str, query: str = "") -> str:
+    """Concatenate *base_url* (no trailing slash) with *path* (leading slash),
+    preserving an optional raw query string."""
+    url = base_url.rstrip("/") + path
+    if query:
+        url += "?" + query
+    return url
 
 
 # ---------------------------------------------------------------------------
