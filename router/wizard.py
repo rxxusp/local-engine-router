@@ -268,6 +268,18 @@ class EngineSelection:
 # everything else (whitespace, YAML specials, control chars, reserved words) is
 # double-quoted with full escaping.
 _SAFE_PLAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./+-]*$")
+# Tokens YAML 1.1 would resolve to a number if emitted bare ("1.5", "123",
+# "1_000", "0x1F", "1e3", ".5", "1.2.3" is fine) — these must be quoted so a
+# numeric-looking model id round-trips as a string.
+_YAML_NUMERIC_RE = re.compile(
+    r"^[+-]?("
+    r"[0-9_]+"                      # int (with YAML 1.1 _ separators)
+    r"|0x[0-9a-fA-F_]+"             # hex
+    r"|0o?[0-7_]+"                  # octal
+    r"|[0-9_]*\.[0-9_]*([eE][+-]?[0-9]+)?"  # float
+    r"|[0-9_]+([eE][+-]?[0-9]+)"    # scientific without dot
+    r")$"
+)
 _YAML_RESERVED = frozenset(
     {
         "true", "false", "null", "yes", "no", "on", "off",
@@ -284,7 +296,11 @@ def _yaml_str(value: str) -> str:
     with full escaping. The result always parses back to the original string, so
     even a hostile id advertised by a local engine cannot inject YAML structure.
     """
-    if _SAFE_PLAIN_RE.match(value) and value not in _YAML_RESERVED:
+    if (
+        _SAFE_PLAIN_RE.match(value)
+        and value not in _YAML_RESERVED
+        and not _YAML_NUMERIC_RE.match(value)
+    ):
         return value
     out: list[str] = []
     for ch in value:

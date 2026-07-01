@@ -7,9 +7,12 @@
 #
 # The image is pure Python (no CUDA, no GPU). The router only proxies to the
 # inference engines, which run on the HOST. Inside a container 127.0.0.1 is the
-# container itself, so in your mounted config set each engine's base_url to
-# http://host.docker.internal:<port> (mapped to the host gateway below), NOT
-# 127.0.0.1.
+# container itself, so in your mounted config:
+#   - set `host: "0.0.0.0"` (the config.example.yaml/wizard default of
+#     127.0.0.1 binds container-loopback only, making the published port
+#     unreachable from the host even though the container reports healthy)
+#   - set each engine's base_url to http://host.docker.internal:<port>
+#     (mapped to the host gateway below), NOT 127.0.0.1.
 #
 # Container limitation: process-control engine types (generic_process / ds4)
 # cannot reach the host's process tree, so only `api_swap` and `ollama` engines

@@ -58,10 +58,14 @@ EXPOSE 8077
 
 # Liveness probe using Python's built-in urllib so no extra tool (curl/wget) is
 # needed. /health returns {"status":"ok"} and never triggers a swap. The port is
-# read from $ROUTER_PORT so it stays honest if you run on a non-default port.
+# read from the mounted config (the same place the app gets it), falling back to
+# $ROUTER_PORT, so it stays honest if you run on a non-default port.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python3 -c \
-        "import os, urllib.request, sys; p=os.environ.get('ROUTER_PORT','8077'); r=urllib.request.urlopen(f'http://localhost:{p}/health',timeout=4); sys.exit(0 if r.status==200 else 1)"
+        "import os, urllib.request, sys, yaml; p=os.environ.get('ROUTER_PORT','8077'); \
+        cfg=os.environ.get('ROUTER_CONFIG','/app/config.yaml'); \
+        p=(yaml.safe_load(open(cfg)) or {}).get('port', p) if os.path.exists(cfg) else p; \
+        r=urllib.request.urlopen(f'http://localhost:{p}/health',timeout=4); sys.exit(0 if r.status==200 else 1)"
 
 # `python -m router` reads $ROUTER_CONFIG (defaults to /app/config.yaml).
 # Provide one, e.g.:

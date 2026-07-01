@@ -7,4 +7,4 @@ and transparently swaps engines (only one heavy model fits in a memory-
 constrained GPU's unified memory at a time) before proxying the request through.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

@@ -4,6 +4,72 @@ All notable changes to this project are documented here. The project aims to
 follow [Semantic Versioning](https://semver.org/) once it reaches a stable API;
 until then it is in a `0.x` channel where minor versions may break.
 
+## [0.6.0] - 2026-07-01
+
+A bug-fix release: a full review of the codebase found and fixed 16 defects.
+No new features and no config changes; everything below makes existing
+behaviour correct.
+
+### Fixed — request handling
+- **Streaming requests no longer mask upstream errors as empty 200 streams.**
+  When the engine returns 4xx/5xx on a streaming request (e.g. context length
+  exceeded), the error is now relayed as a framed SSE `data:` error chunk on
+  `/v1/*` and as an Ollama-style `{"error": ...}` NDJSON line on `/api/*`,
+  instead of raw unframed bytes (or silence) on a 200 response.
+- **Query strings are preserved on proxied requests.** Previously every
+  forwarded and passthrough request silently dropped `?query=params`, breaking
+  any upstream endpoint that takes them (notably via the `/api/*` catch-all).
+- **`/api/pull` now streams NDJSON progress live.** It was buffered through the
+  non-streaming forwarder, so clients saw zero bytes until the entire model
+  download finished and typically timed out.
+- **Valid-but-non-object JSON bodies (`"hi"`, `[1,2]`, `42`) return 400** with a
+  proper `invalid_request_error` instead of crashing with a 500 on `/v1/*`,
+  `/api/*` model-bearing posts, and `/admin/swap`.
+- **Non-ASCII API keys no longer crash auth with a 500.** `hmac.compare_digest`
+  raises `TypeError` on non-ASCII str input; comparison is now done on bytes,
+  so a stray `Authorization: Bearer café` gets a clean 401.
+
+### Fixed — engine lifecycle
+- **Windows: graceful stop no longer escalates straight to a hard kill.** On
+  platforms without `SIGKILL`/`killpg` the force-kill fallback aliased SIGTERM,
+  so the initial graceful stop was misread as a kill request and the
+  SIGTERM→wait→SIGKILL escalation never got its graceful phase.
+- **Post-swap model snapshots can no longer be lost to garbage collection.**
+  The fire-and-forget `asyncio.ensure_future` task now holds a strong
+  reference until it completes (the event loop only keeps weak refs).
+
+### Fixed — config, CLI, wizard
+- **`log_file: router.log` (no directory) now works.** `os.makedirs("")` raised
+  and the handler-install was silently skipped, disabling file logging.
+- **An explicit empty `aliases:` / `api_keys:` key (YAML null) no longer
+  crashes every request** with `AttributeError` at routing time; both
+  normalize to their empty container at load.
+- **The wizard quotes numeric-looking model ids** (`1.5`, `123`, `1_000`,
+  `0x1F`) so a scaffolded config round-trips them as strings; bare, they
+  re-parsed as numbers and could never match request routing.
+- **`routerctl logs`: Ctrl-C exits** instead of falling through to `tail -f`
+  (requiring a second Ctrl-C), and a journalctl that exits non-zero (unknown
+  unit, no journal access) now correctly falls back to tailing the log file.
+- **`routerctl status/models/health` report HTTP errors as HTTP errors.** A
+  401/500 from a *running* router was misreported as "router not reachable"
+  because `HTTPError` subclasses `URLError`.
+
+### Fixed — packaging, deploy, CI
+- **Docker healthcheck honors the configured port.** It read only
+  `$ROUTER_PORT` (which nothing sets from the config), so a non-default
+  `port:` in the mounted config marked a healthy container unhealthy. It now
+  reads the port from the config itself, falling back to the env var.
+- **docker-compose quickstart documents the required `host: "0.0.0.0"` bind** —
+  with the example config's `127.0.0.1` the published port was unreachable
+  from the host while the container still reported healthy.
+- **PyPI publish workflow no longer fails on release-created duplicate runs.**
+  Pushing a tag and then publishing a GitHub Release fired both triggers; the
+  second upload died with "File already exists". Now `skip-existing: true`.
+- **smoke_test.sh step 3 sends one request, not two.** It previously issued
+  the same real (GPU-swapping) completion twice and paired the body of the
+  first with the HTTP status of the second, which could diverge; temp files
+  now use `mktemp` throughout.
+
 ## [0.5.0] - 2026-06-19
 
 This release is about getting from zero to a running router in a couple of

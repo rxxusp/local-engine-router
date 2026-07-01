@@ -96,14 +96,13 @@ fi
 # ---------------------------------------------------------------------------
 printf '\n--- Step 3: POST /v1/chat/completions (%s, non-streaming) ---\n' "$MODEL_A"
 printf '    (may trigger a swap to %s, allow up to 300s)\n' "$ENGINE_A"
-CHAT_A_BODY=$(curl --silent --max-time 300 \
+CHAT_A_TMP=$(mktemp)
+CHAT_A_HTTP=$(curl --silent --max-time 300 --output "$CHAT_A_TMP" --write-out '%{http_code}' \
     -H "Content-Type: application/json" \
     -d "{\"model\":\"${MODEL_A}\",\"stream\":false,\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"say hi in 3 words\"}]}" \
     "${ROUTER_URL}/v1/chat/completions")
-CHAT_A_HTTP=$(curl --silent --max-time 300 --output /dev/null --write-out '%{http_code}' \
-    -H "Content-Type: application/json" \
-    -d "{\"model\":\"${MODEL_A}\",\"stream\":false,\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"say hi in 3 words\"}]}" \
-    "${ROUTER_URL}/v1/chat/completions")
+CHAT_A_BODY=$(cat "$CHAT_A_TMP" 2>/dev/null || echo "{}")
+rm -f "$CHAT_A_TMP"
 CHAT_A_CONTENT=$(python3 -c "
 import json, sys
 try:
@@ -147,11 +146,12 @@ fi
 # ---------------------------------------------------------------------------
 printf '\n--- Step 5: POST /v1/chat/completions (%s, non-streaming) ---\n' "$MODEL_B"
 printf '    (forces a swap away from %s, allow up to 300s)\n' "$ENGINE_A"
-CHAT_B_HTTP=$(curl --silent --max-time 300 --output /tmp/smoke_b_body.json --write-out '%{http_code}' \
+CHAT_B_TMP=$(mktemp)
+CHAT_B_HTTP=$(curl --silent --max-time 300 --output "$CHAT_B_TMP" --write-out '%{http_code}' \
     -H "Content-Type: application/json" \
     -d "{\"model\":\"${MODEL_B}\",\"stream\":false,\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"say hi in 3 words\"}]}" \
     "${ROUTER_URL}/v1/chat/completions")
-CHAT_B_BODY=$(cat /tmp/smoke_b_body.json 2>/dev/null || echo "{}")
+CHAT_B_BODY=$(cat "$CHAT_B_TMP" 2>/dev/null || echo "{}")
 CHAT_B_CONTENT=$(python3 -c "
 import json, sys
 try:
@@ -169,7 +169,7 @@ if [ "$CHAT_B_HTTP" = "200" ] && [[ "$CHAT_B_CONTENT" == ok:* ]]; then
 else
     fail "${MODEL_B} chat failed" "http=${CHAT_B_HTTP} content=${CHAT_B_CONTENT}"
 fi
-rm -f /tmp/smoke_b_body.json
+rm -f "$CHAT_B_TMP"
 
 # ---------------------------------------------------------------------------
 # Step 6: GET /status -> active_engine swapped away from ENGINE_A

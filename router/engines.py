@@ -712,7 +712,7 @@ class GenericProcessEngine(Engine):
             )
         log.info("%s: stopped, VRAM released", self.key)
 
-    def _signal_pids(self, pids: list[int], sig: int) -> None:
+    def _signal_pids(self, pids: list[int], sig: int, *, force: bool = False) -> None:
         """Signal every PID's whole PROCESS GROUP, then any PID directly.
 
         We launch with start_new_session=True so the launcher leads its own
@@ -730,8 +730,11 @@ class GenericProcessEngine(Engine):
         leftover loop does the waiting and escalation, so the event loop is never
         blocked during a swap."""
         if not hasattr(os, "killpg"):
+            # `force` is explicit: on Windows _SIGKILL aliases SIGTERM, so
+            # inferring intent from `sig == _SIGKILL` would hard-kill on the
+            # graceful stop and defeat the SIGTERM->wait->SIGKILL escalation.
             for pid in pids:
-                sysmem.signal_process_tree(pid, kill=(sig == _SIGKILL))
+                sysmem.signal_process_tree(pid, kill=force)
             return
         signalled_pgids: set[int] = set()
         for pid in pids:
@@ -762,7 +765,7 @@ class GenericProcessEngine(Engine):
             return
         log.warning("%s: %s still alive after %s; SIGKILL",
                     self.key, leftover, self.cfg.stop_signal)
-        self._signal_pids(leftover, _SIGKILL)
+        self._signal_pids(leftover, _SIGKILL, force=True)
         await self._wait_stopped(10.0)
 
     async def _wait_stopped(self, timeout_s: float) -> bool:
@@ -1207,6 +1210,10 @@ class EngineManager:
         # Seeded from the state file (if it has a seen_models section) so
         # down-engine discovery can route to engines we have seen before.
         self._seen_models: dict[str, set[str]] = {k: set() for k in self.engines}
+        # Strong refs to fire-and-forget snapshot tasks: the event loop only
+        # holds weak refs, so an unanchored task can be garbage-collected
+        # mid-flight and silently drop the snapshot.
+        self._bg_tasks: set[asyncio.Task] = set()
         self._load_seen_models_from_state()
 
     # -- discovery helpers ---------------------------------------------- #
@@ -1494,7 +1501,9 @@ class EngineManager:
         # discovery is enabled so that the behaviour when discover.enabled is
         # False is byte-identical to the pre-discovery code.
         if self.cfg.discover.enabled:
-            asyncio.ensure_future(self._snapshot_seen_models(target))
+            task = asyncio.ensure_future(self._snapshot_seen_models(target))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
 
     @staticmethod
     def _read_mem_available_kb() -> int | None:

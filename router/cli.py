@@ -72,6 +72,12 @@ def _get(path: str, timeout: float = 15.0) -> Any:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        # HTTPError subclasses URLError: without this branch a 401/500 from a
+        # RUNNING router would be misreported as "router not reachable".
+        body_text = exc.read().decode(errors="replace")
+        print(f"HTTP {exc.code} from router: {body_text}", file=sys.stderr)
+        sys.exit(1)
     except (urllib.error.URLError, ConnectionRefusedError, OSError) as exc:
         _conn_error(exc)
 
@@ -200,17 +206,27 @@ def cmd_health(_args: argparse.Namespace) -> None:
 
 
 def cmd_logs(_args: argparse.Namespace) -> None:
-    # Try journalctl (user unit) first; fall back to tail -f of the log file.
+    # Try journalctl (user unit) first; fall back to tail -f of the log file
+    # when journalctl is missing or exits non-zero (unknown unit, no journal
+    # access). Ctrl-C means "stop following" — exit, don't fall through to
+    # tailing the file.
     try:
-        subprocess.run(["journalctl", "--user", "-u", SERVICE_NAME, "-f"])
-    except (OSError, KeyboardInterrupt):
-        try:
-            subprocess.run(["tail", "-f", LOG_FILE])
-        except KeyboardInterrupt:
-            pass
-        except OSError as exc:
-            print(f"could not tail {LOG_FILE}: {exc}", file=sys.stderr)
-            sys.exit(1)
+        proc = subprocess.run(["journalctl", "--user", "-u", SERVICE_NAME, "-f"])
+        # 0 = clean exit; -2 = killed by the same Ctrl-C SIGINT when the
+        # parent's KeyboardInterrupt loses the race to run() returning.
+        if proc.returncode in (0, -2):
+            return
+    except KeyboardInterrupt:
+        return
+    except OSError:
+        pass
+    try:
+        subprocess.run(["tail", "-f", LOG_FILE])
+    except KeyboardInterrupt:
+        pass
+    except OSError as exc:
+        print(f"could not tail {LOG_FILE}: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_discover(_args: argparse.Namespace) -> None:
