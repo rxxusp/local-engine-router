@@ -45,7 +45,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import metrics
-from .config import RouterConfig
+from .config import ROUTING_MODES, RouterConfig
 from .engines import EngineError, EngineManager, OllamaEngine
 from .proxy import (
     filter_request_headers,
@@ -53,6 +53,7 @@ from .proxy import (
     make_client,
     upstream_url,
 )
+from .smart import SmartDecision, run_calibration
 
 log = logging.getLogger("router.app")
 
@@ -184,6 +185,36 @@ def _apply_thinking_policy(
         model, budget, threshold,
     )
     return json.dumps(body).encode()
+
+
+def _smart_headers(decision: SmartDecision) -> dict[str, str]:
+    """Response headers announcing what the smart picker chose.
+
+    On streaming responses these reflect the primary pick (headers are sent
+    before a fallback could occur); on non-streaming responses the caller
+    overrides model/engine with what actually served."""
+    return {
+        "x-local-engine-router-mode": "smart",
+        "x-local-engine-router-picked-model": decision.model,
+        "x-local-engine-router-picked-engine": decision.engine,
+        "x-local-engine-router-picker-confidence": f"{decision.confidence:.3f}",
+    }
+
+
+def _attempt_plan(model: str, decision: SmartDecision | None) -> list[str]:
+    """Ordered model ids to try for this request.
+
+    Manual mode / exact routing: just the model, exactly as before. Smart
+    mode: the picked model (twice when a same-model reload retry is enabled —
+    a restart often clears a transient startup failure), then the decision's
+    ranked fallbacks."""
+    plan = [model]
+    if decision is not None:
+        if decision.retry.get("same_model_reload"):
+            plan.append(model)
+        if decision.retry.get("fall_forward"):
+            plan.extend(decision.fallbacks)
+    return plan
 
 
 def _find_ollama_engine(manager: EngineManager) -> OllamaEngine | None:
@@ -515,6 +546,162 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         return JSONResponse(await manager.status())
 
     # -----------------------------------------------------------------------
+    # Admin: smart picker
+    # -----------------------------------------------------------------------
+
+    async def _read_json_object(request: Request) -> dict[str, Any] | JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                _openai_error("request body must be JSON", "invalid_request_error"),
+                status_code=400,
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                _openai_error("request body must be a JSON object", "invalid_request_error"),
+                status_code=400,
+            )
+        return body
+
+    @app.post("/admin/smart/resolve")
+    async def admin_smart_resolve(request: Request) -> JSONResponse:
+        """Explain what the smart picker would do for a request, without doing
+        it: selected model + engine, confidence, policy, per-candidate scores,
+        benchmark provenance, swap penalty, and the retry plan. Side-effect
+        free (no swap, no health/last-pick mutation)."""
+        manager: EngineManager = request.app.state.manager
+        body = await _read_json_object(request)
+        if isinstance(body, JSONResponse):
+            return body
+        smart = manager.smart
+        model = str(body.get("model") or (smart.scfg.aliases or ["smart"])[0])
+        endpoint = str(body.get("endpoint") or "/v1/chat/completions")
+        synthetic = {k: v for k, v in body.items() if k != "endpoint"}
+        synthetic.setdefault("model", model)
+        decision = await smart.maybe_pick(model, endpoint, synthetic, dry_run=True)
+        if decision is None:
+            if smart.mode != "smart":
+                reason = "routing_mode is 'manual'; enable with `routerctl smart`"
+            elif await smart._known_exact(model):
+                reason = (
+                    f"{model!r} is an exact local model id / alias; it routes "
+                    "exactly (set smart.override_exact_model_ids to change)"
+                )
+            else:
+                reason = (
+                    "request is not smart-eligible or no candidates are "
+                    "available; legacy fallback routing applies"
+                )
+            return JSONResponse(
+                {
+                    "mode": smart.mode,
+                    "smart_selection": False,
+                    "requested_model": model,
+                    "reason": reason,
+                }
+            )
+        return JSONResponse({"smart_selection": True, **decision.to_dict()})
+
+    @app.post("/admin/smart/mode")
+    async def admin_smart_mode(request: Request) -> JSONResponse:
+        """Switch the active routing mode at runtime (smart <-> manual).
+
+        Used by `routerctl smart` / `routerctl manual` after they update the
+        config file, so the change applies without a restart."""
+        manager: EngineManager = request.app.state.manager
+        body = await _read_json_object(request)
+        if isinstance(body, JSONResponse):
+            return body
+        mode = body.get("mode")
+        if mode not in ROUTING_MODES:
+            return JSONResponse(
+                _openai_error(
+                    f"mode must be one of {sorted(ROUTING_MODES)}",
+                    "invalid_request_error",
+                ),
+                status_code=400,
+            )
+        manager.smart.mode = mode
+        log.info("routing mode set to %r via /admin/smart/mode", mode)
+        return JSONResponse({"routing_mode": mode})
+
+    @app.post("/admin/smart/calibrate")
+    async def admin_smart_calibrate(request: Request) -> JSONResponse:
+        """Run the one-time local smoke calibration for a model (JSON
+        compliance, tool-call formatting, short math, code syntax, instruction
+        following, latency, tokens/sec). Acquires the model's engine, so this
+        can trigger a swap — it is an explicit admin action, never automatic."""
+        manager: EngineManager = request.app.state.manager
+        client: httpx.AsyncClient = request.app.state.client
+        if not cfg.smart.calibration_enabled:
+            return JSONResponse(
+                _openai_error(
+                    "calibration is disabled (smart.calibration_enabled: false)",
+                    "permission_error",
+                ),
+                status_code=403,
+            )
+        body = await _read_json_object(request)
+        if isinstance(body, JSONResponse):
+            return body
+        model = body.get("model")
+        if not model:
+            return JSONResponse(
+                _openai_error("missing required field: 'model'", "invalid_request_error"),
+                status_code=400,
+            )
+        try:
+            result = await run_calibration(manager.smart, client, str(model))
+        except EngineError as exc:
+            return JSONResponse(
+                _openai_error(str(exc), "engine_error"),
+                status_code=_error_status_for(exc),
+            )
+        return JSONResponse({"model": model, **result})
+
+    # -----------------------------------------------------------------------
+    # Admin: benchmark cache
+    # -----------------------------------------------------------------------
+
+    @app.get("/admin/benchmarks")
+    async def admin_benchmarks(request: Request) -> JSONResponse:
+        manager: EngineManager = request.app.state.manager
+        return JSONResponse(manager.smart.benchmarks.summary())
+
+    @app.post("/admin/benchmarks/refresh")
+    async def admin_benchmarks_refresh(request: Request) -> JSONResponse:
+        """Re-fetch benchmark records: for one model when 'model' is given,
+        otherwise for every current candidate + cached model."""
+        manager: EngineManager = request.app.state.manager
+        body = await _read_json_object(request)
+        if isinstance(body, JSONResponse):
+            return body
+        store = manager.smart.benchmarks
+        model = body.get("model")
+        if model:
+            refreshed = store.refresh([str(model)])
+        else:
+            candidates = await manager.smart._enumerate_candidates()
+            store.refresh()  # everything already cached
+            refreshed = store.refresh(list(candidates))
+        manager._persist()
+        return JSONResponse(
+            {"refreshed": sorted(set(refreshed)), "count": len(set(refreshed))}
+        )
+
+    @app.post("/admin/benchmarks/clear")
+    async def admin_benchmarks_clear(request: Request) -> JSONResponse:
+        manager: EngineManager = request.app.state.manager
+        body = await _read_json_object(request)
+        if isinstance(body, JSONResponse):
+            return body
+        model = body.get("model")
+        cleared = manager.smart.benchmarks.clear(str(model) if model else None)
+        manager._persist()
+        return JSONResponse({"cleared": cleared})
+
+    # -----------------------------------------------------------------------
     # Internal helpers used by all proxied routes
     # -----------------------------------------------------------------------
 
@@ -554,157 +741,293 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 status_code=400,
             )
 
-        # Resolve a capability/alias to the real model id and rewrite the body
-        # so the upstream sees the real id (no-op + unchanged bytes if not an alias).
-        model, raw_body = _resolve_alias_and_rewrite(manager, model, body, raw_body)
+        # Smart selection first: smart aliases / cloud model names / unknown
+        # ids resolve to the best local model (see router/smart.py). Exact
+        # local ids and configured aliases return None here and route exactly
+        # as before. The body is rewritten so the upstream sees the real id.
+        decision = await manager.smart.maybe_pick(model, path, body)
+        if decision is not None:
+            model = decision.model
+            body["model"] = model
+            raw_body = json.dumps(body).encode()
+            metrics.record_smart_pick(
+                decision.model, decision.primary_job, decision.confidence
+            )
+            log.info(
+                "smart pick: %s -> %s on %s (job=%s conf=%.2f swap=%s)",
+                decision.requested_model, decision.model, decision.engine,
+                decision.primary_job, decision.confidence, decision.would_swap,
+            )
+        else:
+            # Resolve a capability/alias to the real model id and rewrite the body
+            # so the upstream sees the real id (no-op + unchanged bytes if not an alias).
+            model, raw_body = _resolve_alias_and_rewrite(manager, model, body, raw_body)
 
         # Reasoning/thinking-budget guard (e.g. DiffusionGemma): on small-budget
         # chat requests, turn thinking off so the answer channel isn't starved to
         # empty. No-op + unchanged bytes for models without the policy configured.
+        # The client's own chat_template_kwargs are remembered first so fallback
+        # attempts don't inherit an injection meant for the primary model.
+        client_ctk = body.get("chat_template_kwargs")
         raw_body = _apply_thinking_policy(manager, model, path, body, raw_body)
 
         is_stream: bool = bool(body.get("stream", False))
         fwd_headers = _build_fwd_headers(request)
 
+        # Ordered attempts. Manual/exact routing gets exactly one, preserving
+        # the pre-smart behaviour byte-for-byte.
+        plan = _attempt_plan(model, decision)
+        smart = manager.smart
+
+        def body_for(mid: str) -> bytes:
+            """Request bytes for attempt *mid* (rewrites model on fallbacks)."""
+            if mid == model:
+                return raw_body
+            body["model"] = mid
+            if client_ctk is None:
+                body.pop("chat_template_kwargs", None)
+            else:
+                body["chat_template_kwargs"] = client_ctk
+            rb = json.dumps(body).encode()
+            return _apply_thinking_policy(manager, mid, path, body, rb)
+
         if is_stream:
             # SSE streaming with keep-alive comment injection during swaps.
             async def gen() -> AsyncGenerator[bytes, None]:
-                acq = asyncio.create_task(manager.acquire(model))
-                engine = None
-                try:
-                    # Wait for the engine to be acquired (a swap may be in
-                    # progress), emitting SSE keep-alive comments so the client
-                    # doesn't hit a TTFB/idle timeout. acq is shielded, so a
-                    # keepalive timeout never cancels the in-progress swap.
+                # Retry/fall-forward is only possible before any upstream byte
+                # has been yielded to the client; after that the stream is
+                # committed and errors terminate it. Keep-alive comments are
+                # content-free (SSE parsers ignore them), so they don't commit
+                # the stream.
+                streamed = False
+                for attempt_idx, mid in enumerate(plan):
+                    last_attempt = attempt_idx == len(plan) - 1
+                    if attempt_idx and decision is not None:
+                        metrics.record_smart_fallback(
+                            mid, "reload" if mid == model else "fall_forward"
+                        )
+                        log.info("smart fallback (stream): trying %s", mid)
+                    acq = asyncio.create_task(manager.acquire(mid))
+                    engine = None
                     try:
-                        while not acq.done():
-                            try:
-                                await asyncio.wait_for(
-                                    asyncio.shield(acq),
-                                    timeout=cfg.swap_keepalive_interval_s,
-                                )
-                            except asyncio.TimeoutError:
-                                # If the client vanished while we were waiting on
-                                # a swap, stop here — returning runs the finally
-                                # block which cancels the still-pending acquire.
-                                # Polling explicitly (rather than leaning on
-                                # Starlette's cancellation-based disconnect path)
-                                # keeps swap teardown on a normal control-flow path.
-                                if await request.is_disconnected():
-                                    log.info(
-                                        "client gone during swap wait; aborting %s", model
-                                    )
-                                    return
-                                if cfg.swap_keepalive_enabled:
-                                    log.debug(
-                                        "keepalive: waiting for swap (model=%s)", model
-                                    )
-                                    yield b": keepalive (swapping engines)\n\n"
-                        engine = acq.result()  # raises EngineError on failure
-                    except EngineError as exc:
-                        log.error("acquire failed for %s: %s", model, exc)
-                        yield sse_error_chunk(exc)
-                        yield b"data: [DONE]\n\n"
-                        return
-
-                    log.info("stream %s -> %s", model, engine.key)
-                    url = upstream_url(engine.base_url, path, request.url.query)
-                    try:
-                        async with client.stream(
-                            request.method, url, content=raw_body, headers=fwd_headers
-                        ) as up:
-                            if up.status_code >= 400:
-                                # The 200 SSE response has already started, so we
-                                # can't change the status — but silently relaying
-                                # the upstream's JSON error body as if it were SSE
-                                # would leave clients hanging on unparseable bytes.
-                                # Surface it as a framed error chunk instead.
-                                err_body = (await up.aread()).decode(errors="replace")
-                                log.error(
-                                    "upstream %s returned %d on stream: %s",
-                                    url, up.status_code, err_body[:500],
-                                )
-                                yield sse_error_chunk(
-                                    RuntimeError(
-                                        f"upstream returned {up.status_code}: {err_body[:500]}"
-                                    )
-                                )
-                                yield b"data: [DONE]\n\n"
-                                return
-                            async for chunk in up.aiter_raw():
-                                # Stop pulling from upstream the moment the client
-                                # disconnects. Breaking exits the client.stream()
-                                # context on a NORMAL control-flow path, so its
-                                # __aexit__ deterministically closes the upstream
-                                # connection and the engine aborts generation.
-                                # We can't rely on Starlette cancelling this
-                                # generator on disconnect: that cleanup runs under
-                                # CancelledError, where the upstream close can be
-                                # interrupted before the engine is told to stop —
-                                # leaving a generation running to completion against
-                                # a dead socket (the orphaned-generation GPU leak
-                                # observed in production).
-                                if await request.is_disconnected():
-                                    log.info(
-                                        "client disconnected; aborting upstream stream %s",
-                                        model,
-                                    )
-                                    break
-                                yield chunk
-                    except httpx.HTTPError as exc:
-                        log.error("upstream stream error on %s: %s", url, exc)
-                        yield sse_error_chunk(exc)
-                        yield b"data: [DONE]\n\n"
-                finally:
-                    # Guarantee the in-flight count is released however the
-                    # generator exits: normal end, EngineError, upstream error,
-                    # or client disconnect (CancelledError / GeneratorExit) at
-                    # any point — including mid-swap while emitting keepalives.
-                    if not acq.done():
-                        # Still pending => acquire hasn't incremented in-flight
-                        # yet (the increment is the final step, after any
-                        # explicit model-load), so cancelling here is leak-free.
-                        acq.cancel()
-                    elif engine is None and not acq.cancelled():
-                        # acquire completed (and incremented) but we were
-                        # cancelled before binding `engine`. Recover it so the
-                        # increment is paired with a release.
+                        # Wait for the engine to be acquired (a swap may be in
+                        # progress), emitting SSE keep-alive comments so the client
+                        # doesn't hit a TTFB/idle timeout. acq is shielded, so a
+                        # keepalive timeout never cancels the in-progress swap.
                         try:
-                            engine = acq.result()
-                        except BaseException:
-                            engine = None
-                    if engine is not None:
-                        # shield so a cancellation in flight can't skip release.
-                        await asyncio.shield(manager.release(engine.key))
+                            while not acq.done():
+                                try:
+                                    await asyncio.wait_for(
+                                        asyncio.shield(acq),
+                                        timeout=cfg.swap_keepalive_interval_s,
+                                    )
+                                except asyncio.TimeoutError:
+                                    # If the client vanished while we were waiting on
+                                    # a swap, stop here — returning runs the finally
+                                    # block which cancels the still-pending acquire.
+                                    # Polling explicitly (rather than leaning on
+                                    # Starlette's cancellation-based disconnect path)
+                                    # keeps swap teardown on a normal control-flow path.
+                                    if await request.is_disconnected():
+                                        log.info(
+                                            "client gone during swap wait; aborting %s", mid
+                                        )
+                                        return
+                                    if cfg.swap_keepalive_enabled:
+                                        log.debug(
+                                            "keepalive: waiting for swap (model=%s)", mid
+                                        )
+                                        yield b": keepalive (swapping engines)\n\n"
+                            engine = acq.result()  # raises EngineError on failure
+                        except EngineError as exc:
+                            log.error("acquire failed for %s: %s", mid, exc)
+                            if decision is not None:
+                                smart.record_failure(mid, str(exc))
+                                metrics.record_smart_failure(mid)
+                                manager._persist()
+                                if not last_attempt and not streamed:
+                                    continue
+                            yield sse_error_chunk(exc)
+                            yield b"data: [DONE]\n\n"
+                            return
 
-            return StreamingResponse(gen(), media_type="text/event-stream")
+                        log.info("stream %s -> %s", mid, engine.key)
+                        url = upstream_url(engine.base_url, path, request.url.query)
+                        try:
+                            async with client.stream(
+                                request.method, url, content=body_for(mid),
+                                headers=fwd_headers,
+                            ) as up:
+                                if up.status_code >= 400:
+                                    # The 200 SSE response has already started, so we
+                                    # can't change the status — but silently relaying
+                                    # the upstream's JSON error body as if it were SSE
+                                    # would leave clients hanging on unparseable bytes.
+                                    # Surface it as a framed error chunk instead.
+                                    err_body = (await up.aread()).decode(errors="replace")
+                                    log.error(
+                                        "upstream %s returned %d on stream: %s",
+                                        url, up.status_code, err_body[:500],
+                                    )
+                                    if decision is not None:
+                                        smart.record_failure(
+                                            mid, f"upstream {up.status_code}"
+                                        )
+                                        metrics.record_smart_failure(mid)
+                                    yield sse_error_chunk(
+                                        RuntimeError(
+                                            f"upstream returned {up.status_code}: {err_body[:500]}"
+                                        )
+                                    )
+                                    yield b"data: [DONE]\n\n"
+                                    return
+                                async for chunk in up.aiter_raw():
+                                    # Stop pulling from upstream the moment the client
+                                    # disconnects. Breaking exits the client.stream()
+                                    # context on a NORMAL control-flow path, so its
+                                    # __aexit__ deterministically closes the upstream
+                                    # connection and the engine aborts generation.
+                                    # We can't rely on Starlette cancelling this
+                                    # generator on disconnect: that cleanup runs under
+                                    # CancelledError, where the upstream close can be
+                                    # interrupted before the engine is told to stop —
+                                    # leaving a generation running to completion against
+                                    # a dead socket (the orphaned-generation GPU leak
+                                    # observed in production).
+                                    if await request.is_disconnected():
+                                        log.info(
+                                            "client disconnected; aborting upstream stream %s",
+                                            mid,
+                                        )
+                                        break
+                                    streamed = True
+                                    yield chunk
+                            if decision is not None:
+                                smart.record_success(mid)
+                            return
+                        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                            # Connect-phase failure: no upstream response ever
+                            # started, so falling forward is safe.
+                            log.error("upstream connect error on %s: %s", url, exc)
+                            if decision is not None:
+                                smart.record_failure(mid, str(exc))
+                                metrics.record_smart_failure(mid)
+                                manager._persist()
+                                if not last_attempt and not streamed:
+                                    continue
+                            yield sse_error_chunk(exc)
+                            yield b"data: [DONE]\n\n"
+                            return
+                        except httpx.HTTPError as exc:
+                            # Mid-stream error: bytes may have reached the
+                            # client. NEVER retried.
+                            log.error("upstream stream error on %s: %s", url, exc)
+                            if decision is not None:
+                                smart.record_failure(mid, str(exc))
+                                metrics.record_smart_failure(mid)
+                            yield sse_error_chunk(exc)
+                            yield b"data: [DONE]\n\n"
+                            return
+                    finally:
+                        # Guarantee the in-flight count is released however this
+                        # attempt exits: normal end, EngineError, upstream error,
+                        # or client disconnect (CancelledError / GeneratorExit) at
+                        # any point — including mid-swap while emitting keepalives.
+                        if not acq.done():
+                            # Still pending => acquire hasn't incremented in-flight
+                            # yet (the increment is the final step, after any
+                            # explicit model-load), so cancelling here is leak-free.
+                            acq.cancel()
+                        elif engine is None and not acq.cancelled():
+                            # acquire completed (and incremented) but we were
+                            # cancelled before binding `engine`. Recover it so the
+                            # increment is paired with a release.
+                            try:
+                                engine = acq.result()
+                            except BaseException:
+                                engine = None
+                        if engine is not None:
+                            # shield so a cancellation in flight can't skip release.
+                            await asyncio.shield(manager.release(engine.key))
+
+            return StreamingResponse(
+                gen(),
+                media_type="text/event-stream",
+                headers=_smart_headers(decision) if decision is not None else None,
+            )
         else:
             # Non-streaming: acquire -> proxy -> release. A single JSON body
             # cannot carry keep-alive frames, so a long swap blocks until it
             # completes; non-stream callers MUST set their client read-timeout
             # above the worst-case swap (~240s for a cold ds4 start).
-            engine = None
-            try:
-                engine = await manager.acquire(model)
-            except EngineError as exc:
-                status = _error_status_for(exc)
-                return JSONResponse(_openai_error(str(exc), "engine_error"), status_code=status)
+            for attempt_idx, mid in enumerate(plan):
+                last_attempt = attempt_idx == len(plan) - 1
+                if attempt_idx and decision is not None:
+                    metrics.record_smart_fallback(
+                        mid, "reload" if mid == model else "fall_forward"
+                    )
+                    log.info("smart fallback: trying %s", mid)
+                engine = None
+                try:
+                    engine = await manager.acquire(mid)
+                except EngineError as exc:
+                    if decision is not None:
+                        smart.record_failure(mid, str(exc))
+                        metrics.record_smart_failure(mid)
+                        manager._persist()
+                        if not last_attempt:
+                            continue
+                    status = _error_status_for(exc)
+                    return JSONResponse(
+                        _openai_error(str(exc), "engine_error"), status_code=status
+                    )
 
-            log.info("request %s -> %s", model, engine.key)
-            url = upstream_url(engine.base_url, path, request.url.query)
-            try:
-                status, resp_headers, body_bytes = await forward(
-                    client, request.method, url, fwd_headers, raw_body
-                )
-            except httpx.HTTPError as exc:
-                log.error("upstream error on %s: %s", url, exc)
-                return JSONResponse(
-                    _openai_error(str(exc), "upstream_error"), status_code=502
-                )
-            finally:
-                await manager.release(engine.key)
+                log.info("request %s -> %s", mid, engine.key)
+                url = upstream_url(engine.base_url, path, request.url.query)
+                try:
+                    status, resp_headers, body_bytes = await forward(
+                        client, request.method, url, fwd_headers, body_for(mid)
+                    )
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    # Connect-phase failure: nothing was sent to the client yet
+                    # and the upstream never started answering — safe to retry.
+                    log.error("upstream connect error on %s: %s", url, exc)
+                    if decision is not None:
+                        smart.record_failure(mid, str(exc))
+                        metrics.record_smart_failure(mid)
+                        manager._persist()
+                        if not last_attempt:
+                            continue
+                    return JSONResponse(
+                        _openai_error(str(exc), "upstream_error"), status_code=502
+                    )
+                except httpx.HTTPError as exc:
+                    log.error("upstream error on %s: %s", url, exc)
+                    if decision is not None:
+                        smart.record_failure(mid, str(exc))
+                        metrics.record_smart_failure(mid)
+                    return JSONResponse(
+                        _openai_error(str(exc), "upstream_error"), status_code=502
+                    )
+                finally:
+                    if engine is not None:
+                        await manager.release(engine.key)
 
-            return Response(content=body_bytes, status_code=status, headers=resp_headers)
+                if decision is not None:
+                    if status < 500:
+                        smart.record_success(mid)
+                    else:
+                        smart.record_failure(mid, f"upstream {status}")
+                        metrics.record_smart_failure(mid)
+                    resp_headers = {
+                        **resp_headers,
+                        **_smart_headers(decision),
+                        "x-local-engine-router-picked-model": mid,
+                        "x-local-engine-router-picked-engine": engine.key,
+                    }
+                return Response(
+                    content=body_bytes, status_code=status, headers=resp_headers
+                )
 
     @app.post("/v1/chat/completions")
     async def v1_chat_completions(request: Request) -> Response:
@@ -762,14 +1085,40 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 status_code=400,
             )
 
-        # Resolve a capability/alias to the real model id and rewrite the body
-        # so the upstream sees the real id (no-op + unchanged bytes if not an alias).
-        model, raw_body = _resolve_alias_and_rewrite(manager, model, body, raw_body)
+        # Smart selection first (see _handle_v1_post); exact ids and configured
+        # aliases return None and route exactly as before.
+        decision = await manager.smart.maybe_pick(model, path, body)
+        if decision is not None:
+            model = decision.model
+            body["model"] = model
+            raw_body = json.dumps(body).encode()
+            metrics.record_smart_pick(
+                decision.model, decision.primary_job, decision.confidence
+            )
+            log.info(
+                "smart pick: %s -> %s on %s (job=%s conf=%.2f swap=%s)",
+                decision.requested_model, decision.model, decision.engine,
+                decision.primary_job, decision.confidence, decision.would_swap,
+            )
+        else:
+            # Resolve a capability/alias to the real model id and rewrite the body
+            # so the upstream sees the real id (no-op + unchanged bytes if not an alias).
+            model, raw_body = _resolve_alias_and_rewrite(manager, model, body, raw_body)
 
         # Ollama streams by default; only non-stream if explicitly false.
         is_stream: bool = body.get("stream", True) is not False
 
         fwd_headers = _build_fwd_headers(request)
+
+        plan = _attempt_plan(model, decision)
+        smart = manager.smart
+
+        def body_for(mid: str) -> bytes:
+            """Request bytes for attempt *mid* (rewrites model on fallbacks)."""
+            if mid == model:
+                return raw_body
+            body["model"] = mid
+            return json.dumps(body).encode()
 
         if is_stream:
             # NDJSON stream with keep-alive during swaps. The StreamingResponse
@@ -784,130 +1133,221 @@ def create_app(cfg: RouterConfig) -> FastAPI:
             # This mirrors the shielded-acquire + finally-release pattern proven
             # in _handle_v1_post's gen(), including its cancellation/leak-safety.
             async def ndjson_gen() -> AsyncGenerator[bytes, None]:
-                acq = asyncio.create_task(manager.acquire(model))
-                engine = None
-                try:
-                    # Wait for the engine to be acquired (a swap may be in
-                    # progress), emitting NDJSON-safe holding frames so the
-                    # client doesn't hit a TTFB/idle timeout. acq is shielded,
-                    # so a keepalive timeout never cancels the in-progress swap.
+                # Fall-forward is only allowed before any upstream byte has
+                # been yielded; bare-newline holding frames are content-free
+                # and don't commit the stream.
+                streamed = False
+                for attempt_idx, mid in enumerate(plan):
+                    last_attempt = attempt_idx == len(plan) - 1
+                    if attempt_idx and decision is not None:
+                        metrics.record_smart_fallback(
+                            mid, "reload" if mid == model else "fall_forward"
+                        )
+                        log.info("smart fallback (api stream): trying %s", mid)
+                    acq = asyncio.create_task(manager.acquire(mid))
+                    engine = None
                     try:
-                        while not acq.done():
-                            try:
-                                await asyncio.wait_for(
-                                    asyncio.shield(acq),
-                                    timeout=cfg.swap_keepalive_interval_s,
-                                )
-                            except asyncio.TimeoutError:
-                                # Client gone while waiting on a swap: stop and let
-                                # the finally block cancel the pending acquire.
-                                # (See the SSE handler for why we poll explicitly
-                                # rather than rely on Starlette's disconnect path.)
-                                if await request.is_disconnected():
-                                    log.info(
-                                        "client gone during swap wait; aborting %s", model
-                                    )
-                                    return
-                                if cfg.swap_keepalive_enabled:
-                                    log.debug(
-                                        "keepalive: waiting for swap (model=%s)", model
-                                    )
-                                    # Bare newline: skipped by NDJSON readers.
-                                    yield b"\n"
-                        engine = acq.result()  # raises EngineError on failure
-                    except EngineError as exc:
-                        # Can't inject a JSON error into a half-started NDJSON
-                        # stream without risking client confusion; log and end
-                        # the stream (mirrors the upstream-error handling below).
-                        log.error("acquire failed for %s: %s", model, exc)
-                        return
-
-                    log.info("api stream %s -> %s", model, engine.key)
-                    url = upstream_url(engine.base_url, path, request.url.query)
-                    try:
-                        async with client.stream(
-                            request.method, url, content=raw_body, headers=fwd_headers
-                        ) as up:
-                            if up.status_code >= 400:
-                                # The 200 NDJSON response has already started; relay
-                                # the upstream error as an Ollama-style error line
-                                # rather than masking it as a silent empty stream.
-                                err_body = (await up.aread()).decode(errors="replace")
-                                log.error(
-                                    "upstream %s returned %d on stream: %s",
-                                    url, up.status_code, err_body[:500],
-                                )
-                                yield json.dumps(
-                                    {"error": f"upstream returned {up.status_code}: {err_body[:500]}"}
-                                ).encode() + b"\n"
-                                return
-                            async for chunk in up.aiter_raw():
-                                # Abort the upstream pull when the client
-                                # disconnects so the engine stops generating into
-                                # a dead socket. See the SSE handler above for the
-                                # full rationale (a normal-control-flow break closes
-                                # the upstream deterministically; cancellation-based
-                                # cleanup may not).
-                                if await request.is_disconnected():
-                                    log.info(
-                                        "client disconnected; aborting upstream stream %s",
-                                        model,
-                                    )
-                                    break
-                                yield chunk
-                    except httpx.HTTPError as exc:
-                        log.error("upstream stream error on %s: %s", url, exc)
-                        # Can't inject SSE; just end the stream.
-                finally:
-                    # Guarantee the in-flight count is released however the
-                    # generator exits: normal end, EngineError, upstream error,
-                    # or client disconnect (CancelledError / GeneratorExit) at
-                    # any point — including mid-swap while emitting keepalives.
-                    if not acq.done():
-                        # Still pending => acquire hasn't incremented in-flight
-                        # yet (the increment is the final step, after any
-                        # explicit model-load), so cancelling here is leak-free.
-                        acq.cancel()
-                    elif engine is None and not acq.cancelled():
-                        # acquire completed (and incremented) but we were
-                        # cancelled before binding `engine`. Recover it so the
-                        # increment is paired with a release.
+                        # Wait for the engine to be acquired (a swap may be in
+                        # progress), emitting NDJSON-safe holding frames so the
+                        # client doesn't hit a TTFB/idle timeout. acq is shielded,
+                        # so a keepalive timeout never cancels the in-progress swap.
                         try:
-                            engine = acq.result()
-                        except BaseException:
-                            engine = None
-                    if engine is not None:
-                        # shield so a cancellation in flight can't skip release.
-                        await asyncio.shield(manager.release(engine.key))
+                            while not acq.done():
+                                try:
+                                    await asyncio.wait_for(
+                                        asyncio.shield(acq),
+                                        timeout=cfg.swap_keepalive_interval_s,
+                                    )
+                                except asyncio.TimeoutError:
+                                    # Client gone while waiting on a swap: stop and let
+                                    # the finally block cancel the pending acquire.
+                                    # (See the SSE handler for why we poll explicitly
+                                    # rather than rely on Starlette's disconnect path.)
+                                    if await request.is_disconnected():
+                                        log.info(
+                                            "client gone during swap wait; aborting %s", mid
+                                        )
+                                        return
+                                    if cfg.swap_keepalive_enabled:
+                                        log.debug(
+                                            "keepalive: waiting for swap (model=%s)", mid
+                                        )
+                                        # Bare newline: skipped by NDJSON readers.
+                                        yield b"\n"
+                            engine = acq.result()  # raises EngineError on failure
+                        except EngineError as exc:
+                            # Can't inject a JSON error into a half-started NDJSON
+                            # stream without risking client confusion; log and end
+                            # the stream (mirrors the upstream-error handling below).
+                            log.error("acquire failed for %s: %s", mid, exc)
+                            if decision is not None:
+                                smart.record_failure(mid, str(exc))
+                                metrics.record_smart_failure(mid)
+                                manager._persist()
+                                if not last_attempt and not streamed:
+                                    continue
+                            return
 
-            return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")
+                        log.info("api stream %s -> %s", mid, engine.key)
+                        url = upstream_url(engine.base_url, path, request.url.query)
+                        try:
+                            async with client.stream(
+                                request.method, url, content=body_for(mid),
+                                headers=fwd_headers,
+                            ) as up:
+                                if up.status_code >= 400:
+                                    # The 200 NDJSON response has already started; relay
+                                    # the upstream error as an Ollama-style error line
+                                    # rather than masking it as a silent empty stream.
+                                    err_body = (await up.aread()).decode(errors="replace")
+                                    log.error(
+                                        "upstream %s returned %d on stream: %s",
+                                        url, up.status_code, err_body[:500],
+                                    )
+                                    if decision is not None:
+                                        smart.record_failure(
+                                            mid, f"upstream {up.status_code}"
+                                        )
+                                        metrics.record_smart_failure(mid)
+                                    yield json.dumps(
+                                        {"error": f"upstream returned {up.status_code}: {err_body[:500]}"}
+                                    ).encode() + b"\n"
+                                    return
+                                async for chunk in up.aiter_raw():
+                                    # Abort the upstream pull when the client
+                                    # disconnects so the engine stops generating into
+                                    # a dead socket. See the SSE handler above for the
+                                    # full rationale (a normal-control-flow break closes
+                                    # the upstream deterministically; cancellation-based
+                                    # cleanup may not).
+                                    if await request.is_disconnected():
+                                        log.info(
+                                            "client disconnected; aborting upstream stream %s",
+                                            mid,
+                                        )
+                                        break
+                                    streamed = True
+                                    yield chunk
+                            if decision is not None:
+                                smart.record_success(mid)
+                            return
+                        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                            # Connect-phase failure: no upstream response ever
+                            # started, so falling forward is safe.
+                            log.error("upstream connect error on %s: %s", url, exc)
+                            if decision is not None:
+                                smart.record_failure(mid, str(exc))
+                                metrics.record_smart_failure(mid)
+                                manager._persist()
+                                if not last_attempt and not streamed:
+                                    continue
+                            return
+                        except httpx.HTTPError as exc:
+                            log.error("upstream stream error on %s: %s", url, exc)
+                            if decision is not None:
+                                smart.record_failure(mid, str(exc))
+                                metrics.record_smart_failure(mid)
+                            # Can't inject SSE; just end the stream. Mid-stream
+                            # errors are NEVER retried.
+                            return
+                    finally:
+                        # Guarantee the in-flight count is released however this
+                        # attempt exits: normal end, EngineError, upstream error,
+                        # or client disconnect (CancelledError / GeneratorExit) at
+                        # any point — including mid-swap while emitting keepalives.
+                        if not acq.done():
+                            # Still pending => acquire hasn't incremented in-flight
+                            # yet (the increment is the final step, after any
+                            # explicit model-load), so cancelling here is leak-free.
+                            acq.cancel()
+                        elif engine is None and not acq.cancelled():
+                            # acquire completed (and incremented) but we were
+                            # cancelled before binding `engine`. Recover it so the
+                            # increment is paired with a release.
+                            try:
+                                engine = acq.result()
+                            except BaseException:
+                                engine = None
+                        if engine is not None:
+                            # shield so a cancellation in flight can't skip release.
+                            await asyncio.shield(manager.release(engine.key))
+
+            return StreamingResponse(
+                ndjson_gen(),
+                media_type="application/x-ndjson",
+                headers=_smart_headers(decision) if decision is not None else None,
+            )
         else:
             # Non-streaming: acquire -> proxy -> release. A single JSON body
             # cannot carry holding frames, so a long swap blocks until it
             # completes; non-stream callers MUST set their client read-timeout
             # above the worst-case swap (~240s for a cold ds4 start).
-            engine = None
-            try:
-                engine = await manager.acquire(model)
-            except EngineError as exc:
-                status = _error_status_for(exc)
-                return JSONResponse(_openai_error(str(exc), "engine_error"), status_code=status)
+            for attempt_idx, mid in enumerate(plan):
+                last_attempt = attempt_idx == len(plan) - 1
+                if attempt_idx and decision is not None:
+                    metrics.record_smart_fallback(
+                        mid, "reload" if mid == model else "fall_forward"
+                    )
+                    log.info("smart fallback (api): trying %s", mid)
+                engine = None
+                try:
+                    engine = await manager.acquire(mid)
+                except EngineError as exc:
+                    if decision is not None:
+                        smart.record_failure(mid, str(exc))
+                        metrics.record_smart_failure(mid)
+                        manager._persist()
+                        if not last_attempt:
+                            continue
+                    status = _error_status_for(exc)
+                    return JSONResponse(
+                        _openai_error(str(exc), "engine_error"), status_code=status
+                    )
 
-            log.info("api request %s -> %s (stream=False)", model, engine.key)
-            url = upstream_url(engine.base_url, path, request.url.query)
-            try:
-                status, resp_headers, body_bytes = await forward(
-                    client, request.method, url, fwd_headers, raw_body
-                )
-            except httpx.HTTPError as exc:
-                log.error("upstream error on %s: %s", url, exc)
-                return JSONResponse(
-                    _openai_error(str(exc), "upstream_error"), status_code=502
-                )
-            finally:
-                await manager.release(engine.key)
+                log.info("api request %s -> %s (stream=False)", mid, engine.key)
+                url = upstream_url(engine.base_url, path, request.url.query)
+                try:
+                    status, resp_headers, body_bytes = await forward(
+                        client, request.method, url, fwd_headers, body_for(mid)
+                    )
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    log.error("upstream connect error on %s: %s", url, exc)
+                    if decision is not None:
+                        smart.record_failure(mid, str(exc))
+                        metrics.record_smart_failure(mid)
+                        manager._persist()
+                        if not last_attempt:
+                            continue
+                    return JSONResponse(
+                        _openai_error(str(exc), "upstream_error"), status_code=502
+                    )
+                except httpx.HTTPError as exc:
+                    log.error("upstream error on %s: %s", url, exc)
+                    if decision is not None:
+                        smart.record_failure(mid, str(exc))
+                        metrics.record_smart_failure(mid)
+                    return JSONResponse(
+                        _openai_error(str(exc), "upstream_error"), status_code=502
+                    )
+                finally:
+                    if engine is not None:
+                        await manager.release(engine.key)
 
-            return Response(content=body_bytes, status_code=status, headers=resp_headers)
+                if decision is not None:
+                    if status < 500:
+                        smart.record_success(mid)
+                    else:
+                        smart.record_failure(mid, f"upstream {status}")
+                        metrics.record_smart_failure(mid)
+                    resp_headers = {
+                        **resp_headers,
+                        **_smart_headers(decision),
+                        "x-local-engine-router-picked-model": mid,
+                        "x-local-engine-router-picked-engine": engine.key,
+                    }
+                return Response(
+                    content=body_bytes, status_code=status, headers=resp_headers
+                )
 
     @app.post("/api/chat")
     async def api_chat(request: Request) -> Response:

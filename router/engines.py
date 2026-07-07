@@ -56,6 +56,7 @@ from . import metrics
 from . import sysmem
 from .catalog import ModelCatalog
 from .config import RouterConfig, build_model_index
+from .smart import SmartRouter
 
 log = logging.getLogger("router.engines")
 
@@ -1218,6 +1219,23 @@ class EngineManager:
         self.catalog = ModelCatalog(cfg, self.engines)
         self._seen_models.update(self.catalog.seen_models())
         self._refresh_task: asyncio.Task | None = None
+        # Smart model picker: always constructed (it's cheap and holds the
+        # runtime mode flag); it only picks when its mode is "smart".
+        self.smart = SmartRouter(cfg, self)
+        self._load_smart_state()
+
+    def _load_smart_state(self) -> None:
+        """Seed smart-picker health/calibration + benchmark cache from the
+        persisted state file (best-effort; ignores IO/parse errors)."""
+        try:
+            with open(self.cfg.state_file) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        self.smart.load_state(data.get("smart"))
+        self.smart.benchmarks.load_state(data.get("benchmarks"))
 
     # -- discovery helpers ---------------------------------------------- #
     def _load_seen_models_from_state(self) -> None:
@@ -1686,6 +1704,8 @@ class EngineManager:
             "ok": ok,
             "at": int(time.time()),
         }
+        # Feed the smart picker's per-engine swap-cost estimate.
+        self.smart.note_swap(to, dt, ok)
 
     # -- admin / observability ------------------------------------------ #
     async def force_swap(self, model_id: str | None = None, engine_key: str | None = None) -> Engine:
@@ -1724,6 +1744,8 @@ class EngineManager:
                 {"id": s.id, "engine": s.engine, "name": s.display_name}
                 for s in self.cfg.models
             ],
+            "routing_mode": self.smart.mode,
+            "smart": self.smart.status_summary(),
         }
 
     def _persist(self) -> None:
@@ -1742,6 +1764,17 @@ class EngineManager:
                     k: sorted(v) for k, v in self._seen_models.items() if v
                 }
                 state["catalog"] = self.catalog.state_payload()
+            # Smart-picker state (health/calibration/swap estimates) and the
+            # benchmark cache. Written whenever there is anything to keep, so
+            # `routerctl manual` doesn't wipe learned state across a toggle.
+            smart_payload = self.smart.state_payload()
+            if any(smart_payload.values()):
+                state["smart"] = smart_payload
+            bench_payload = self.smart.benchmarks.state_payload()
+            if bench_payload:
+                state["benchmarks"] = bench_payload
+            self.smart.dirty = False
+            self.smart.benchmarks.dirty = False
             tmp = f"{self.cfg.state_file}.tmp"
             with open(tmp, "w") as fh:
                 json.dump(state, fh)

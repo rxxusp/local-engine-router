@@ -59,6 +59,186 @@
       "type": "object",
       "additionalProperties": true
     },
+    "routing_mode": {
+      "type": "string",
+      "enum": [
+        "manual",
+        "smart"
+      ],
+      "default": "smart",
+      "description": "'smart' (default): the picker chooses the best local model for smart aliases / cloud names / unknown ids. 'manual': exact model-id routing only."
+    },
+    "smart": {
+      "type": "object",
+      "description": "Smart model-picker settings; active when routing_mode is 'smart' (the default). Absent = all defaults.",
+      "properties": {
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "smart",
+            "auto",
+            "default"
+          ],
+          "description": "Request model ids that always trigger smart selection."
+        },
+        "policy": {
+          "type": "string",
+          "default": "balanced",
+          "description": "Active scoring policy: balanced | fast | quality | economy, or a custom name defined under policies."
+        },
+        "policies": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "context": {
+                "type": "number",
+                "minimum": 0
+              },
+              "quality": {
+                "type": "number",
+                "minimum": 0
+              },
+              "reliability": {
+                "type": "number",
+                "minimum": 0
+              },
+              "residency": {
+                "type": "number",
+                "minimum": 0
+              },
+              "speed": {
+                "type": "number",
+                "minimum": 0
+              },
+              "swap_cost": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          },
+          "description": "Custom named policies (weight presets)."
+        },
+        "weights": {
+          "type": "object",
+          "properties": {
+            "context": {
+              "type": "number",
+              "minimum": 0
+            },
+            "quality": {
+              "type": "number",
+              "minimum": 0
+            },
+            "reliability": {
+              "type": "number",
+              "minimum": 0
+            },
+            "residency": {
+              "type": "number",
+              "minimum": 0
+            },
+            "speed": {
+              "type": "number",
+              "minimum": 0
+            },
+            "swap_cost": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "description": "Scoring-component weight overrides, merged over the active policy's weights."
+        },
+        "catch_cloud_models": {
+          "type": "boolean",
+          "default": true
+        },
+        "catch_unknown_models": {
+          "type": "boolean",
+          "default": true
+        },
+        "override_exact_model_ids": {
+          "type": "boolean",
+          "default": false
+        },
+        "swap_margin": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.08,
+          "description": "Score advantage a non-resident model needs over the best resident candidate to justify an engine swap."
+        },
+        "min_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.25
+        },
+        "swap_cost_horizon_s": {
+          "type": "number",
+          "minimum": 0,
+          "default": 180.0
+        },
+        "retry": {
+          "type": "object",
+          "properties": {
+            "same_model_reload": {
+              "type": "boolean",
+              "default": true
+            },
+            "fall_forward": {
+              "type": "boolean",
+              "default": true
+            },
+            "max_fallbacks": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 2
+            },
+            "failure_threshold": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 3
+            },
+            "cooldown_s": {
+              "type": "number",
+              "minimum": 0,
+              "default": 120.0
+            }
+          },
+          "additionalProperties": false
+        },
+        "benchmarks": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "allow_network": {
+              "type": "boolean",
+              "default": false
+            },
+            "cache_ttl_s": {
+              "type": "number",
+              "minimum": 0,
+              "default": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        "calibration_enabled": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
     "ds4": {
       "type": "object",
       "properties": {
@@ -486,6 +666,82 @@
             ],
             "default": null,
             "description": "Inject chat_template_kwargs.enable_thinking=false on chat requests whose max_tokens is below this, so a small budget isn't eaten by the reasoning channel. null/omitted = off."
+          },
+          "quality_tier": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional coarse quality tier 1 (worst) .. 5 (best) for the smart picker; omitted = derive from benchmark priors."
+          },
+          "speed_tier": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional coarse speed tier 1 (slowest) .. 5 (fastest) for the smart picker; omitted = derive from model size."
+          },
+          "memory_gb": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Approximate loaded memory footprint in GB."
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "code_editing",
+                "coding",
+                "embedding",
+                "general",
+                "json_structured",
+                "long_context",
+                "math",
+                "reasoning",
+                "summarization",
+                "tool_use",
+                "vision",
+                "writing"
+              ]
+            },
+            "description": "What the model can do; empty = general chat model. Include 'embedding' / 'vision' so the smart picker matches request shape."
+          },
+          "strengths": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "description": "Per-capability score overrides (0..1) that beat benchmark priors for the smart picker."
+          },
+          "smart_enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Set false to exclude this model from smart selection (it stays routable by its exact id)."
           }
         },
         "required": [

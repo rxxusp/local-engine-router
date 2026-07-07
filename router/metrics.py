@@ -43,6 +43,9 @@ _SETTLE_BUCKETS: tuple[float, ...] = (
 _INFLIGHT_BUCKETS: tuple[float, ...] = (
     0, 1, 2, 4, 8, 16, 32, 64,
 )
+_CONFIDENCE_BUCKETS: tuple[float, ...] = (
+    0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
+)
 
 
 class _Histogram:
@@ -124,6 +127,27 @@ _swap_total = _Counter(
     "Total engine swaps by transition and result.",
     ("from", "to", "result"),
 )
+_smart_pick_total = _Counter(
+    "smart_pick_total",
+    "Requests routed by the smart picker, by picked model and primary job.",
+    ("model", "job"),
+)
+_smart_fallback_total = _Counter(
+    "smart_fallback_total",
+    "Smart-mode fall-forward attempts, by the model being retried/replaced "
+    "and the reason.",
+    ("model", "reason"),
+)
+_smart_failure_total = _Counter(
+    "smart_failure_total",
+    "Failures recorded against smart-picked models.",
+    ("model",),
+)
+_smart_confidence = _Histogram(
+    "smart_pick_confidence",
+    "Decision confidence of smart picks (0..1).",
+    _CONFIDENCE_BUCKETS,
+)
 
 # Active engine bookkeeping for engine_uptime_seconds. We record the key that
 # is currently active and the wall-clock time it became active; uptime is
@@ -156,6 +180,25 @@ def record_in_flight_at_swap_start(n: int) -> None:
         _in_flight_at_swap.observe(n)
 
 
+def record_smart_pick(model: str, job: str, confidence: float) -> None:
+    """Record one smart-picker routing decision."""
+    with _lock:
+        _smart_pick_total.inc((model, job))
+        _smart_confidence.observe(confidence)
+
+
+def record_smart_fallback(model: str, reason: str) -> None:
+    """Record a smart-mode retry/fall-forward attempt."""
+    with _lock:
+        _smart_fallback_total.inc((model, reason))
+
+
+def record_smart_failure(model: str) -> None:
+    """Record a failure attributed to a smart-picked model."""
+    with _lock:
+        _smart_failure_total.inc((model,))
+
+
 def set_active_engine(key: str | None) -> None:
     """Mark *key* as the currently-active engine (resets its uptime clock)."""
     global _active_engine, _active_since
@@ -170,11 +213,14 @@ def reset() -> None:  # pragma: no cover - test/helper convenience
     """Reset all metrics to zero (primarily for tests)."""
     global _active_engine, _active_since
     with _lock:
-        for h in (_swap_duration, _memory_settle, _in_flight_at_swap):
+        for h in (_swap_duration, _memory_settle, _in_flight_at_swap,
+                  _smart_confidence):
             h.counts = [0] * len(h.bounds)
             h.sum = 0.0
             h.count = 0
-        _swap_total.values.clear()
+        for c in (_swap_total, _smart_pick_total, _smart_fallback_total,
+                  _smart_failure_total):
+            c.values.clear()
         _active_engine = None
         _active_since = None
 
@@ -186,9 +232,12 @@ def render() -> str:
     """Render all metrics in Prometheus text exposition format (v0.0.4)."""
     with _lock:
         lines: list[str] = []
-        for hist in (_swap_duration, _memory_settle, _in_flight_at_swap):
+        for hist in (_swap_duration, _memory_settle, _in_flight_at_swap,
+                     _smart_confidence):
             lines.extend(hist.render_lines())
-        lines.extend(_swap_total.render_lines())
+        for counter in (_swap_total, _smart_pick_total, _smart_fallback_total,
+                        _smart_failure_total):
+            lines.extend(counter.render_lines())
 
         # engine_uptime_seconds is computed live from _active_since.
         lines.append(
