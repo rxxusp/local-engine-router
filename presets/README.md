@@ -22,6 +22,13 @@ a new backend. Read [`../config.example.yaml`](../config.example.yaml) and
 4. Start the router and send a request with the model `id` you chose. The
    router brings the engine up on first use and swaps the GPU to it.
 
+In the default smart routing mode, models you add this way automatically
+become smart-picker candidates too (send `model: "smart"` and the router
+weighs them against everything else it can serve). Add optional per-model
+metadata — `quality_tier`, `speed_tier`, `capabilities`, `strengths`,
+`smart_enabled: false` — to steer or opt out; see the models section of
+[`../config.example.yaml`](../config.example.yaml).
+
 Validate your edits against the schema with
 [`validate_presets.py`](validate_presets.py), or just start the router (it
 validates the whole config at load time and reports actionable errors).

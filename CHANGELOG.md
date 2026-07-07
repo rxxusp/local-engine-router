@@ -4,6 +4,85 @@ All notable changes to this project are documented here. The project aims to
 follow [Semantic Versioning](https://semver.org/) once it reaches a stable API;
 until then it is in a `0.x` channel where minor versions may break.
 
+## [0.7.0] - 2026-07-07
+
+The smart model picker: `routing_mode: smart` is now the default for fresh
+installs. Send `model: "smart"` (or a cloud model name like `gpt-4o` /
+`claude-*`, or any unknown id) and the router picks the best local model for
+each request. Exact configured/installed model ids keep routing exactly, and
+`routerctl manual` restores exact-ids-only routing everywhere — with that set,
+behaviour is identical to 0.6.
+
+### Added — smart routing
+- **Swap-aware model selection** (`router/smart.py`). Each eligible request is
+  classified into weighted job dimensions (coding, code editing, math,
+  reasoning, tool use, writing, summarization, long context, JSON/structured,
+  speed, reliability) using deterministic low-latency signals only: endpoint
+  type, tools, `response_format`/`format: json`, code fences, stack traces,
+  diffs, file paths, equations, prompt length, message count, `max_tokens`.
+  Every locally servable candidate (static registry, discovery catalog, live
+  engine tags) is then scored on quality fit, speed, context fit, engine
+  residency, expected swap cost, and observed reliability. The headline rule:
+  a non-resident winner must beat the best already-resident candidate by
+  `smart.swap_margin` — the router asks whether the stronger model is worth
+  unloading the current engine, waiting for memory reclaim, and cold-starting
+  another backend for *this* request.
+- **Model identity canonicalization** (`router/model_identity.py`). GGUF
+  filenames, HF repo ids, Ollama tags, AWQ/GPTQ/EXL2/MLX/fp8 repacks,
+  instruct/base variants, community fine-tunes, and abliterated/uncensored
+  variants all resolve to one canonical model, with quantization penalties per
+  spelling and base-model inheritance for tunes.
+- **Benchmark intelligence** (`router/benchmarks.py`). A curated offline
+  priors table (distilled from Artificial Analysis, LMArena, Aider Polyglot,
+  LiveCodeBench, BigCodeBench, SWE-bench, BFCL, TAU-bench, MathArena/AIME,
+  IFEval, RULER) scores candidates per capability with provenance. Records are
+  fetched once per canonical model and persisted in `state_file`; network
+  providers are pluggable and gated behind `smart.benchmarks.allow_network`
+  (off by default — sync is explicit, routing works fully offline). Obscure
+  models are never excluded: fine-tunes inherit base scores at reduced
+  confidence and unknown ids get a flat low-confidence prior.
+- **Local smoke calibration** (`POST /admin/smart/calibrate`). Optional
+  per-model probes for JSON compliance, tool-call formatting, short math,
+  code syntax, instruction following, latency, and tokens/sec — measured
+  against your actual quantized copy; results persist and override priors.
+- **Retry / fall-forward policy** for smart-picked requests: never after
+  response bytes have reached the client (keep-alive frames don't count); one
+  same-model retry after an engine reload on transient startup/load/connect
+  failures; then fall forward to the next-ranked compatible candidate. Models
+  that fail `failure_threshold` times consecutively enter a cooldown and are
+  skipped until they recover. Manual mode and exact-id requests keep the exact
+  pre-0.7 single-attempt behaviour.
+- **Config**: `routing_mode: smart | manual` (default `smart`) and a `smart:`
+  block (aliases, policies `balanced|fast|quality|economy` + custom, scoring
+  weights, `swap_margin`, `min_confidence`, retry, benchmarks, calibration,
+  `override_exact_model_ids`). Per-model metadata: `quality_tier`,
+  `speed_tier`, `memory_gb`, `capabilities` (incl. `embedding`/`vision`),
+  `strengths`, `smart_enabled`. All validated with actionable errors and
+  described in `config.schema.json`.
+- **Observability**: `x-local-engine-router-mode` / `-picked-model` /
+  `-picked-engine` / `-picker-confidence` response headers on smart-picked
+  responses; `smart` section in `/status` (mode, policy, last pick, health,
+  cooldowns, benchmark cache); metrics `smart_pick_total{model,job}`,
+  `smart_pick_confidence`, `smart_fallback_total{model,reason}`,
+  `smart_failure_total{model}`.
+- **Admin API**: `POST /admin/smart/resolve` (side-effect-free decision
+  explain), `POST /admin/smart/mode` (runtime toggle),
+  `POST /admin/smart/calibrate`, `GET /admin/benchmarks`,
+  `POST /admin/benchmarks/refresh`, `POST /admin/benchmarks/clear`.
+- **routerctl**: `smart` / `manual` (update the config file, validated, and
+  the running router), `explain smart --message "..."` (full decision
+  diagnostics), `benchmarks refresh|show|clear [model]`; `status` now shows
+  the routing mode and last pick.
+- **Fresh installs**: `routerctl init`, `--example`, the starter scaffold,
+  `config.example.yaml`, and `config.schema.json` all default to and document
+  smart mode.
+
+### Compatibility
+- Exact model ids, configured aliases, discovery, the thinking policy,
+  `/admin/resolve`, `/admin/swap`, catalog behaviour, streaming keepalives,
+  and in-flight accounting are unchanged; the full pre-0.7 test suite passes
+  unmodified. `routing_mode: manual` restores prior routing for every request.
+
 ## [0.6.0] - 2026-07-01
 
 A bug-fix release: a full review of the codebase found and fixed 16 defects.

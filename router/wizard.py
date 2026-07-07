@@ -444,6 +444,13 @@ def build_config_yaml(
     else:
         lines.append("api_keys: []   # set a key here if you bind off-localhost")
     lines.append("")
+    lines.append("# Smart routing (the default): send model \"smart\", \"auto\", or a cloud model")
+    lines.append("# name (gpt-*, claude-*, ...) and the router picks the best local model for")
+    lines.append("# the request — weighing benchmarks, context fit, and whether a GPU engine")
+    lines.append("# swap is worth it. Exact model ids below always route exactly.")
+    lines.append("# Switch to exact-ids-only routing with:  routerctl manual")
+    lines.append("routing_mode: smart")
+    lines.append("")
 
     if selections:
         lines.append("engines:")
@@ -497,6 +504,16 @@ STARTER_CONFIG = """\
 host: 127.0.0.1
 port: 8077
 api_keys: []          # set a long random key if you bind off-localhost (host: 0.0.0.0)
+
+# Smart routing (the default): send model "smart", "auto", or a cloud model
+# name (gpt-4o, claude-*, ...) and the router picks the best local model for
+# each request — combining benchmark priors, context fit, reliability, and
+# whether unloading the current engine for a stronger model is worth the swap.
+# Exact model ids always route exactly. Switch modes any time:
+#   routerctl manual    # exact model-id routing only
+#   routerctl smart     # re-enable the picker
+# Inspect a decision:  routerctl explain smart --message "fix this bug"
+routing_mode: smart
 
 engines:
   # Ollama: the router unloads its models on swap-away; it does not launch the

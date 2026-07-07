@@ -9,6 +9,14 @@ out which local engine owns it, and **swaps engines on demand** so your clients
 never have to know which backend is currently active. The proxy itself is **pure
 Python and uses no GPU**.
 
+Send `model: "smart"` (or a cloud model name like `gpt-4o` / `claude-*` from a
+stock client) and the router **picks the best local model for each request** —
+classifying the job (coding, math, tool use, writing, ...), scoring every local
+candidate against public-benchmark priors and observed reliability, and asking
+the question only a local router can answer: *is the stronger model worth
+unloading the current engine, waiting for memory reclaim, and cold-starting
+another backend for this request?* See [Smart routing](#smart-routing-default).
+
 Built and verified on a DGX Spark (GB10, 128 GB unified CPU+GPU memory), where
 DeepSeek-V4-Flash alone uses ~81 GB and running two heavy engines simultaneously
 causes OOM failures.
@@ -403,6 +411,140 @@ uses `ready_path: /v1/models` + `ready_check: "model:<id>"` to work around it).
 ```
 
 
+## Smart routing (default)
+
+Fresh installs run in `routing_mode: smart`. Three kinds of request `model`
+values go through the smart picker; **everything else routes exactly as it
+always has**:
+
+1. **Smart aliases** — `smart`, `auto`, `default` (configurable via
+   `smart.aliases`).
+2. **Cloud model names** — `gpt-4o`, `claude-3-5-sonnet-*`, `gemini-*`, `o3-*`,
+   `grok-*`, ... so stock clients and SDK defaults transparently reach your
+   best local model.
+3. **Unknown model ids** — anything that would otherwise hit the
+   guess-an-engine fallback.
+
+Exact configured/installed model ids (and configured aliases) always route
+exactly — an explicit id is an explicit choice (`smart.override_exact_model_ids`
+flips that). Switch the whole router back to exact-ids-only routing with
+`routerctl manual`, and back with `routerctl smart` (both update the config
+file *and* the running router).
+
+### How a pick works
+
+For each eligible request the picker runs entirely locally, in microseconds,
+with deterministic signals — no classifier model, no network:
+
+1. **Job classification.** Endpoint type, tools/`tool_choice`,
+   `response_format`/`format: json`, code fences, stack traces, diffs, file
+   paths, equations, "summarize"/"write a story" verbs, prompt length, message
+   count, and `max_tokens` produce weighted job dimensions (`coding`,
+   `code_editing`, `math`, `reasoning`, `tool_use`, `writing`,
+   `summarization`, `long_context`, `json_structured`, `speed`,
+   `reliability`).
+2. **Candidate enumeration.** Every locally servable model: the static
+   `models:` registry, the discovery catalog, and live engine tags. Embedding
+   models only serve embeddings endpoints (and vice versa); requests with
+   images only consider vision-capable models.
+3. **Scoring.** Each candidate gets a weighted total of:
+   *quality fit* (benchmark priors x job weights, overridden by your
+   `strengths`/`quality_tier` metadata and local calibration), *speed*
+   (`speed_tier`, calibrated tokens/sec, or model size), *context fit*
+   (prompt + budget vs. `context_length` — models that can't fit are
+   excluded), *residency* (already on the active engine), *swap cost*
+   (observed swap durations per engine, in-flight drain pressure), and
+   *reliability* (recent failures; models in cooldown are skipped).
+4. **The swap-worth-it rule.** The headline feature: a non-resident winner
+   must beat the best already-resident candidate by `smart.swap_margin`.
+   A marginally-better 70B is not worth a 90-second engine swap; a decisively
+   better one is.
+
+The picked real model id is written into the request body before proxying, and
+successful responses carry the decision in headers:
+
+```
+x-local-engine-router-mode: smart
+x-local-engine-router-picked-model: qwen2.5-coder-14b-instruct
+x-local-engine-router-picked-engine: llamacpp
+x-local-engine-router-picker-confidence: 0.812
+```
+
+### Benchmark intelligence
+
+Public benchmark results are used as *priors*, never truth. A curated offline
+table (distilled from Artificial Analysis, LMArena, Aider Polyglot,
+LiveCodeBench, BigCodeBench, SWE-bench, BFCL, TAU-bench, MathArena/AIME
+aggregates, IFEval, RULER) ships with the router, so scoring works fully
+offline. Model ids are canonicalized first — `qwen2.5-7b-instruct-q4_k_m.gguf`,
+`Qwen/Qwen2.5-7B-Instruct-AWQ`, and `qwen2.5:7b` all resolve to the same
+canonical model — with quantization penalties applied per spelling. Community
+fine-tunes and abliterated variants are never excluded: they inherit their base
+model's scores at reduced confidence. Records are fetched once per canonical
+model, persisted in `state_file`, and inspectable:
+
+```bash
+routerctl benchmarks show            # cached records with provenance
+routerctl benchmarks refresh         # re-resolve all candidates
+routerctl benchmarks clear [model]   # drop cache entries
+```
+
+Providers that fetch over the network can be plugged in
+(`router.benchmarks.register_provider`) and are gated behind
+`smart.benchmarks.allow_network: false` — benchmark *sync* is explicit and
+opt-in; cached and user-specified metadata always works offline.
+
+Optionally, run a one-time local smoke calibration per model — JSON
+compliance, tool-call formatting, short math, code syntax, instruction
+following, latency, tokens/sec — measured against *your* quantized copy on
+*your* hardware (it acquires the engine, so it can trigger a swap):
+
+```bash
+curl -X POST localhost:8077/admin/smart/calibrate -d '{"model":"llama3.1:8b"}'
+```
+
+### Reliability
+
+Smart-picked requests get a retry/fall-forward policy (`smart.retry`):
+
+- **Never after streamed bytes.** Once real response bytes have reached the
+  client, nothing is retried. Keep-alive frames don't count — they're
+  content-free.
+- Before the response starts, a transient startup/load/connect failure retries
+  the same model once after the engine reload, then falls forward to the
+  next-ranked compatible candidate.
+- A model that keeps failing (`failure_threshold` consecutive errors) enters a
+  cooldown (`cooldown_s`) and is skipped by the picker until it recovers; a
+  success resets it. Health, cooldowns, and the last pick appear in `/status`
+  under `smart`.
+
+Manual mode and exact-id requests keep the exact pre-smart behaviour: one
+attempt, no retries, no headers.
+
+### Explaining a decision
+
+```bash
+routerctl explain smart --message "fix this bug: TypeError in app.py"
+```
+
+prints the picked model and engine, confidence, policy, job weights, the full
+per-candidate score breakdown (including exclusions like "context does not
+fit" or "in failure cooldown"), estimated swap cost, ranked fallbacks, and the
+benchmark provenance behind the quality scores. The same diagnostics are
+served by `POST /admin/smart/resolve` (side-effect-free — it never swaps).
+
+### Policies and tuning
+
+`smart.policy` selects a scoring-weight preset: `balanced` (default), `fast`
+(favor small/resident models), `quality` (swap aggressively for stronger
+models), `economy` (avoid swaps hardest). Define your own under
+`smart.policies` and/or override individual `smart.weights` (keys: `quality`,
+`speed`, `residency`, `swap_cost`, `reliability`, `context`). Per-model
+metadata (`quality_tier`, `speed_tier`, `capabilities`, `strengths`,
+`smart_enabled`) beats benchmark priors wherever you supply it — see the
+[models section of `config.example.yaml`](config.example.yaml).
+
+
 ## Config reference
 
 Copy `config.example.yaml` to `config.yaml` and edit for your machine. A
@@ -422,6 +564,8 @@ python3 -m router --print-schema    # print the JSON Schema
 |-----|---------|-------------|
 | `host` | `127.0.0.1` | Bind address. Use `0.0.0.0` to expose off-localhost (pair with `api_keys`). |
 | `port` | `8077` | Listen port. |
+| `routing_mode` | `smart` | `smart` = the picker chooses the best local model for smart aliases / cloud names / unknown ids; `manual` = exact model-id routing only. Toggle with `routerctl smart` / `routerctl manual`. |
+| `smart` | *(defaults)* | Smart-picker settings: `aliases`, `policy`, `weights`, `policies`, `swap_margin`, `retry`, `benchmarks`, ... — see [Smart routing](#smart-routing-default) and `config.example.yaml`. |
 | `api_keys` | `[]` | When non-empty, require a key on all requests except `GET /health`. |
 | `allow_destructive_ollama_api` | `false` | Allow `/api/delete`, `/api/create`, `/api/copy`, `/api/push`, `/api/blobs` (refused with 403 when false). |
 | `log_level` | `INFO` | Python log level. |
@@ -617,6 +761,12 @@ notes.
 | GET | `/admin/catalog` | Return the merged runtime model catalog. Auth-gated the same as `/admin/swap`. |
 | POST | `/admin/resolve` | Body: `{"model":"<id>"}`. Explain alias/catalog/fallback routing for a model without swapping. |
 | POST | `/admin/discover` | Refresh the catalog and return the merged catalog plus per-engine summary. Auth-gated the same as `/admin/swap`. |
+| POST | `/admin/smart/resolve` | Body: `{"model": "...", "messages": [...], "endpoint": "..."}` (all optional). Explain the smart pick: model, engine, confidence, policy, candidate scores, benchmark provenance, swap penalty, retry plan. Side-effect-free. |
+| POST | `/admin/smart/mode` | Body: `{"mode": "smart"\|"manual"}`. Switch routing mode at runtime (used by `routerctl smart`/`manual`). |
+| POST | `/admin/smart/calibrate` | Body: `{"model":"<id>"}`. Run the local smoke-calibration probes for a model (may trigger a swap). Disabled by `smart.calibration_enabled: false`. |
+| GET | `/admin/benchmarks` | Benchmark cache summary with per-model records and provenance. |
+| POST | `/admin/benchmarks/refresh` | Body: `{"model":"<id>"}` or `{}` (all candidates). Re-fetch benchmark records. |
+| POST | `/admin/benchmarks/clear` | Body: `{"model":"<id>"}` or `{}` (all). Drop benchmark cache entries. |
 
 
 ## Metrics
@@ -631,6 +781,10 @@ dependency -- the exposition is hand-rolled.
 | `in_flight_at_swap_start` | histogram | In-flight requests being drained at swap start |
 | `swap_total{from,to,result}` | counter | Count of swaps by transition and result (`ok`/`error`) |
 | `engine_uptime_seconds{engine}` | gauge | Seconds the active engine has been active |
+| `smart_pick_total{model,job}` | counter | Smart-picker decisions by picked model and primary job label |
+| `smart_pick_confidence` | histogram | Decision confidence of smart picks (0..1) |
+| `smart_fallback_total{model,reason}` | counter | Smart retry/fall-forward attempts (`reload` / `fall_forward`) |
+| `smart_failure_total{model}` | counter | Failures recorded against smart-picked models |
 
 
 ## routerctl
@@ -643,6 +797,12 @@ routerctl models                    # list all known models
 routerctl catalog                   # show merged catalog entries with sources
 routerctl refresh                   # refresh the catalog now
 routerctl explain qwen2.5-7b-instruct  # explain route, alias, and swap decision
+routerctl explain smart --message "fix this bug"  # full smart-picker diagnostics
+routerctl smart                     # enable smart routing (config + running router)
+routerctl manual                    # exact model-id routing only
+routerctl benchmarks show           # benchmark cache with provenance
+routerctl benchmarks refresh        # re-resolve benchmark priors (all or one model)
+routerctl benchmarks clear          # drop benchmark cache entries
 routerctl use llamacpp              # swap to a specific engine now
 routerctl use qwen2.5-7b-instruct   # or name a model; swaps to its owning engine
 routerctl discover                  # compatibility alias: refresh and print per-engine model ids

@@ -60,6 +60,33 @@ ENGINE_TYPES: frozenset[str] = frozenset(
     {"ds4", "ollama", "generic_process", "api_swap"}
 )
 
+# Valid routing modes. "smart" (the default) lets the router pick the best
+# local model for smart aliases / cloud-model names / unknown ids; "manual"
+# preserves exact model-id routing for everything (the pre-0.7 behaviour).
+ROUTING_MODES: frozenset[str] = frozenset({"smart", "manual"})
+
+# Scoring components the smart picker combines; the keys allowed in
+# smart.weights and smart.policies.<name>.
+SMART_WEIGHT_KEYS: frozenset[str] = frozenset(
+    {"quality", "speed", "residency", "swap_cost", "reliability", "context"}
+)
+
+# Built-in smart policies (weight presets). A config may add its own under
+# smart.policies; smart.policy must name one of these or a config-defined one.
+SMART_BUILTIN_POLICIES: frozenset[str] = frozenset(
+    {"balanced", "fast", "quality", "economy"}
+)
+
+# Capabilities a model may declare in its metadata. The benchmark capability
+# axes plus request-shape capabilities that gate candidate eligibility.
+MODEL_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        "general", "coding", "code_editing", "math", "reasoning", "tool_use",
+        "writing", "summarization", "long_context", "json_structured",
+        "embedding", "vision",
+    }
+)
+
 
 class ConfigError(ValueError):
     """Raised for structural configuration problems with an actionable message.
@@ -92,6 +119,24 @@ class ModelSpec:
     # quality path). None = feature off. vLLM honors request-level
     # chat_template_kwargs over the server's --default-chat-template-kwargs.
     disable_thinking_below_max_tokens: int | None = None
+    # ---- optional smart-picker metadata (all default to "unknown") -------- #
+    # Coarse quality/speed tiers, 1 (worst) .. 5 (best). None = derive from
+    # benchmark priors / model identity / observed runtime stats instead.
+    quality_tier: int | None = None
+    speed_tier: int | None = None
+    # Approximate memory footprint when loaded, in GB (informational; used for
+    # swap-cost estimation when set).
+    memory_gb: float | None = None
+    # What the model can do. Empty = a general chat model (everything except
+    # "embedding"/"vision"). Include "embedding" for embedding models and
+    # "vision" for multimodal ones so the picker matches endpoint/request shape.
+    capabilities: list[str] = field(default_factory=list)
+    # Per-capability score overrides (0..1) that beat benchmark priors, e.g.
+    # {"coding": 0.9} for a model you know punches above its benchmarks.
+    strengths: dict[str, float] = field(default_factory=dict)
+    # Set false to keep this model out of smart selection entirely (it stays
+    # routable by its exact id).
+    smart_enabled: bool = True
 
 
 @dataclass
@@ -297,6 +342,83 @@ class DiscoverConfig:
     port_probe_enabled: bool = False
 
 
+@dataclass
+class SmartRetryConfig:
+    """Retry/fall-forward policy for smart-picked requests.
+
+    Applies only to requests the smart picker routed. The inviolable rule —
+    never retry after response bytes have reached the client — is enforced in
+    the app layer and is not configurable."""
+
+    # Re-try the SAME model once when its engine fails to come up (a reload /
+    # restart often clears a transient startup failure).
+    same_model_reload: bool = True
+    # After that, fall forward to the next-ranked compatible candidate(s).
+    fall_forward: bool = True
+    # How many fallback candidates a decision carries (bounds total attempts).
+    max_fallbacks: int = 2
+    # Consecutive failures before a model enters cooldown ...
+    failure_threshold: int = 3
+    # ... and how long the cooldown lasts.
+    cooldown_s: float = 120.0
+
+
+@dataclass
+class SmartBenchmarksConfig:
+    """Benchmark-intelligence settings for the smart picker."""
+
+    # Use benchmark priors at all (off = metadata + calibration + runtime only).
+    enabled: bool = True
+    # Allow providers that need network egress. The builtin curated table is
+    # offline, so routing works fully offline with this false (the default);
+    # benchmark *sync* is an explicit, opt-in action.
+    allow_network: bool = False
+    # Cache TTL for fetched records; 0 = never expire (refresh is explicit via
+    # `routerctl benchmarks refresh`).
+    cache_ttl_s: float = 0.0
+
+
+@dataclass
+class SmartConfig:
+    """Settings for the smart model picker (see router/smart.py).
+
+    Active when ``routing_mode: smart`` (the default). All fields have
+    sensible defaults so an empty/absent ``smart:`` block fully works."""
+
+    # Request model ids that always trigger smart selection.
+    aliases: list[str] = field(default_factory=lambda: ["smart", "auto", "default"])
+    # Active scoring policy: balanced | fast | quality | economy, or a custom
+    # name defined under `policies:` below.
+    policy: str = "balanced"
+    # Route well-known cloud model ids (gpt-*, claude-*, gemini-*, ...) through
+    # the picker instead of the legacy unknown-model fallback.
+    catch_cloud_models: bool = True
+    # Route any OTHER unknown model id through the picker too (otherwise those
+    # fall back to the legacy default-engine guess).
+    catch_unknown_models: bool = True
+    # When true, even exact configured/installed model ids go through the
+    # picker. Default false: an exact id is an explicit user choice.
+    override_exact_model_ids: bool = False
+    # Minimum total-score advantage a non-resident model must have over the
+    # best already-resident candidate to justify an engine swap.
+    swap_margin: float = 0.08
+    # Below this decision confidence, prefer the resident candidate.
+    min_confidence: float = 0.25
+    # Seconds of expected swap cost that count as "maximally expensive" when
+    # normalizing the swap-cost score component.
+    swap_cost_horizon_s: float = 180.0
+    # Scoring-component weight overrides (merged over the policy's weights).
+    # Keys: quality, speed, residency, swap_cost, reliability, context.
+    weights: dict[str, float] = field(default_factory=dict)
+    # Custom named policies: {name -> {weight key -> value}}.
+    policies: dict[str, dict[str, float]] = field(default_factory=dict)
+    retry: SmartRetryConfig = field(default_factory=SmartRetryConfig)
+    benchmarks: SmartBenchmarksConfig = field(default_factory=SmartBenchmarksConfig)
+    # Allow POST /admin/smart/calibrate to run local smoke probes (it acquires
+    # engines, so it can trigger swaps; the probes themselves are tiny).
+    calibration_enabled: bool = True
+
+
 # Maps an engine ``type`` to the dataclass holding its parameters.
 _ENGINE_PARAM_CLASSES: dict[str, type] = {
     "ds4": Ds4Config,
@@ -378,6 +500,13 @@ class RouterConfig:
     aliases: dict[str, str] = field(default_factory=dict)
     # Global model-discovery settings. Absent in config => all defaults (off).
     discover: DiscoverConfig = field(default_factory=DiscoverConfig)
+    # Routing mode: "smart" (default; the picker chooses the best local model
+    # for smart aliases / cloud names / unknown ids) or "manual" (exact
+    # model-id routing only — the pre-0.7 behaviour). Switch with
+    # `routerctl manual` / `routerctl smart`.
+    routing_mode: str = "smart"
+    # Smart-picker settings; ignored when routing_mode is "manual".
+    smart: SmartConfig = field(default_factory=SmartConfig)
 
     # Convenience -------------------------------------------------------- #
     def engine_keys(self) -> list[str]:
@@ -578,6 +707,237 @@ def _parse_nonnegative_float(value: Any, field_name: str) -> float:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Smart-picker section parsing
+# --------------------------------------------------------------------------- #
+_SMART_KNOWN_KEYS: frozenset[str] = frozenset(
+    {
+        "aliases", "policy", "policies", "weights", "catch_cloud_models",
+        "catch_unknown_models", "override_exact_model_ids", "swap_margin",
+        "min_confidence", "swap_cost_horizon_s", "retry", "benchmarks",
+        "calibration_enabled",
+    }
+)
+_SMART_RETRY_KNOWN_KEYS: frozenset[str] = frozenset(
+    {"same_model_reload", "fall_forward", "max_fallbacks",
+     "failure_threshold", "cooldown_s"}
+)
+_SMART_BENCHMARKS_KNOWN_KEYS: frozenset[str] = frozenset(
+    {"enabled", "allow_network", "cache_ttl_s"}
+)
+
+
+def _parse_weight_table(raw: Any, ctx: str) -> dict[str, float]:
+    """Validate a {weight key -> number} mapping for smart.weights / policies."""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{ctx} must be a mapping of weight -> number")
+    unknown = set(raw) - SMART_WEIGHT_KEYS
+    if unknown:
+        raise ConfigError(
+            f"unknown weight key(s) under {ctx}: {sorted(unknown)} "
+            f"(known: {sorted(SMART_WEIGHT_KEYS)})"
+        )
+    out: dict[str, float] = {}
+    for key, val in raw.items():
+        out[key] = _parse_nonnegative_float(val, f"{ctx}.{key}")
+    if out and not any(v > 0 for v in out.values()):
+        raise ConfigError(f"{ctx}: at least one weight must be > 0")
+    return out
+
+
+def _parse_fraction(value: Any, field_name: str) -> float:
+    out = _parse_nonnegative_float(value, field_name)
+    if out > 1:
+        raise ConfigError(f"{field_name} must be between 0 and 1 (got {value!r})")
+    return out
+
+
+def _parse_smart_section(raw_smart: Any) -> SmartConfig:
+    """Parse the optional top-level ``smart:`` mapping into a SmartConfig.
+
+    Absent/null returns all defaults. Raises ConfigError on unknown keys or
+    invalid values (mirrors the strictness of the ``discover:`` parser)."""
+    if not raw_smart:
+        return SmartConfig()
+    if not isinstance(raw_smart, dict):
+        raise ConfigError("'smart' must be a mapping")
+
+    unknown = set(raw_smart) - _SMART_KNOWN_KEYS
+    if unknown:
+        raise ConfigError(
+            f"unknown key(s) under 'smart': {sorted(unknown)} "
+            f"(known: {sorted(_SMART_KNOWN_KEYS)})"
+        )
+
+    defaults = SmartConfig()
+
+    aliases = raw_smart.get("aliases", defaults.aliases)
+    if not isinstance(aliases, list) or not all(
+        isinstance(a, str) and a for a in aliases
+    ):
+        raise ConfigError("smart.aliases must be a list of non-empty strings")
+
+    policies_raw = raw_smart.get("policies") or {}
+    if not isinstance(policies_raw, dict):
+        raise ConfigError("smart.policies must be a mapping of name -> weights")
+    policies: dict[str, dict[str, float]] = {}
+    for name, table in policies_raw.items():
+        if not isinstance(name, str) or not name:
+            raise ConfigError("smart.policies keys must be non-empty strings")
+        policies[name] = _parse_weight_table(table, f"smart.policies.{name}")
+
+    policy = raw_smart.get("policy", defaults.policy)
+    valid_policies = SMART_BUILTIN_POLICIES | set(policies)
+    if policy not in valid_policies:
+        raise ConfigError(
+            f"smart.policy {policy!r} is not a built-in policy "
+            f"({sorted(SMART_BUILTIN_POLICIES)}) or defined under smart.policies"
+        )
+
+    weights = _parse_weight_table(raw_smart.get("weights") or {}, "smart.weights")
+
+    retry_raw = raw_smart.get("retry") or {}
+    if not isinstance(retry_raw, dict):
+        raise ConfigError("'smart.retry' must be a mapping")
+    unknown_r = set(retry_raw) - _SMART_RETRY_KNOWN_KEYS
+    if unknown_r:
+        raise ConfigError(
+            f"unknown key(s) under 'smart.retry': {sorted(unknown_r)} "
+            f"(known: {sorted(_SMART_RETRY_KNOWN_KEYS)})"
+        )
+    retry_defaults = SmartRetryConfig()
+    max_fallbacks = retry_raw.get("max_fallbacks", retry_defaults.max_fallbacks)
+    failure_threshold = retry_raw.get(
+        "failure_threshold", retry_defaults.failure_threshold
+    )
+    for name, val in (("max_fallbacks", max_fallbacks),
+                      ("failure_threshold", failure_threshold)):
+        if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+            raise ConfigError(f"smart.retry.{name} must be a non-negative integer")
+    retry = SmartRetryConfig(
+        same_model_reload=bool(
+            retry_raw.get("same_model_reload", retry_defaults.same_model_reload)
+        ),
+        fall_forward=bool(retry_raw.get("fall_forward", retry_defaults.fall_forward)),
+        max_fallbacks=max_fallbacks,
+        failure_threshold=failure_threshold,
+        cooldown_s=_parse_nonnegative_float(
+            retry_raw.get("cooldown_s", retry_defaults.cooldown_s),
+            "smart.retry.cooldown_s",
+        ),
+    )
+
+    bench_raw = raw_smart.get("benchmarks") or {}
+    if not isinstance(bench_raw, dict):
+        raise ConfigError("'smart.benchmarks' must be a mapping")
+    unknown_b = set(bench_raw) - _SMART_BENCHMARKS_KNOWN_KEYS
+    if unknown_b:
+        raise ConfigError(
+            f"unknown key(s) under 'smart.benchmarks': {sorted(unknown_b)} "
+            f"(known: {sorted(_SMART_BENCHMARKS_KNOWN_KEYS)})"
+        )
+    bench_defaults = SmartBenchmarksConfig()
+    benchmarks = SmartBenchmarksConfig(
+        enabled=bool(bench_raw.get("enabled", bench_defaults.enabled)),
+        allow_network=bool(bench_raw.get("allow_network", bench_defaults.allow_network)),
+        cache_ttl_s=_parse_nonnegative_float(
+            bench_raw.get("cache_ttl_s", bench_defaults.cache_ttl_s),
+            "smart.benchmarks.cache_ttl_s",
+        ),
+    )
+
+    return SmartConfig(
+        aliases=list(aliases),
+        policy=str(policy),
+        catch_cloud_models=bool(
+            raw_smart.get("catch_cloud_models", defaults.catch_cloud_models)
+        ),
+        catch_unknown_models=bool(
+            raw_smart.get("catch_unknown_models", defaults.catch_unknown_models)
+        ),
+        override_exact_model_ids=bool(
+            raw_smart.get("override_exact_model_ids", defaults.override_exact_model_ids)
+        ),
+        swap_margin=_parse_fraction(
+            raw_smart.get("swap_margin", defaults.swap_margin), "smart.swap_margin"
+        ),
+        min_confidence=_parse_fraction(
+            raw_smart.get("min_confidence", defaults.min_confidence),
+            "smart.min_confidence",
+        ),
+        swap_cost_horizon_s=_parse_nonnegative_float(
+            raw_smart.get("swap_cost_horizon_s", defaults.swap_cost_horizon_s),
+            "smart.swap_cost_horizon_s",
+        ),
+        weights=weights,
+        policies=policies,
+        retry=retry,
+        benchmarks=benchmarks,
+        calibration_enabled=bool(
+            raw_smart.get("calibration_enabled", defaults.calibration_enabled)
+        ),
+    )
+
+
+def _parse_model_smart_metadata(m: dict[str, Any]) -> dict[str, Any]:
+    """Validate + normalize the optional smart-picker fields of a model entry."""
+    mid = m.get("id", "?")
+    out: dict[str, Any] = {}
+
+    for tier_name in ("quality_tier", "speed_tier"):
+        tier = m.get(tier_name)
+        if tier is not None:
+            if not isinstance(tier, int) or isinstance(tier, bool) or not (
+                1 <= tier <= 5
+            ):
+                raise ConfigError(
+                    f"model {mid!r}: {tier_name} must be an integer 1..5 "
+                    f"(got {tier!r}); omit it to derive from benchmarks"
+                )
+        out[tier_name] = tier
+
+    memory_gb = m.get("memory_gb")
+    if memory_gb is not None:
+        try:
+            memory_gb = float(memory_gb)
+        except (TypeError, ValueError):
+            raise ConfigError(f"model {mid!r}: memory_gb must be a number")
+        if memory_gb <= 0:
+            raise ConfigError(f"model {mid!r}: memory_gb must be > 0")
+    out["memory_gb"] = memory_gb
+
+    caps = m.get("capabilities") or []
+    if not isinstance(caps, list) or not all(isinstance(c, str) for c in caps):
+        raise ConfigError(f"model {mid!r}: capabilities must be a list of strings")
+    unknown_caps = set(caps) - MODEL_CAPABILITIES
+    if unknown_caps:
+        raise ConfigError(
+            f"model {mid!r}: unknown capability(ies) {sorted(unknown_caps)} "
+            f"(known: {sorted(MODEL_CAPABILITIES)})"
+        )
+    out["capabilities"] = list(caps)
+
+    strengths = m.get("strengths") or {}
+    if not isinstance(strengths, dict):
+        raise ConfigError(
+            f"model {mid!r}: strengths must be a mapping of capability -> 0..1"
+        )
+    unknown_str = set(strengths) - MODEL_CAPABILITIES
+    if unknown_str:
+        raise ConfigError(
+            f"model {mid!r}: unknown strength key(s) {sorted(unknown_str)} "
+            f"(known: {sorted(MODEL_CAPABILITIES)})"
+        )
+    for cap, score in strengths.items():
+        out.setdefault("strengths", {})[cap] = _parse_fraction(
+            score, f"model {mid!r} strengths.{cap}"
+        )
+    out.setdefault("strengths", {})
+
+    out["smart_enabled"] = bool(m.get("smart_enabled", True))
+    return out
+
+
 def _validate_generic_process_fields(key: str, params: GenericProcessConfig) -> None:
     """Validate the new discovery-related fields on a GenericProcessConfig.
 
@@ -660,12 +1020,22 @@ def load_config(path: str) -> RouterConfig:
                 display_name=m.get("display_name", m["id"]),
                 context_length=int(m.get("context_length", 131072)),
                 disable_thinking_below_max_tokens=_thinking_floor,
+                **_parse_model_smart_metadata(m),
             )
         )
 
     discover = _parse_discover_section(raw.get("discover"))
+    smart = _parse_smart_section(raw.get("smart"))
 
-    skip = {"ds4", "ollama", "engines", "models", "discover"}
+    routing_mode = raw.get("routing_mode", "smart")
+    if routing_mode not in ROUTING_MODES:
+        raise ConfigError(
+            f"routing_mode {routing_mode!r} is not valid "
+            f"(must be one of {sorted(ROUTING_MODES)})"
+        )
+
+    skip = {"ds4", "ollama", "engines", "models", "discover", "smart",
+            "routing_mode"}
     top = {
         k: v
         for k, v in raw.items()
@@ -680,7 +1050,7 @@ def load_config(path: str) -> RouterConfig:
         top["api_keys"] = []
     cfg = RouterConfig(
         ds4=ds4, ollama=ollama, engines=engines, models=models,
-        discover=discover, **top
+        discover=discover, smart=smart, routing_mode=routing_mode, **top
     )
 
     # Validate model -> engine references against whatever engines are configured.
@@ -696,7 +1066,34 @@ def load_config(path: str) -> RouterConfig:
             )
 
     _validate_aliases(cfg)
+    _validate_smart(cfg)
     return cfg
+
+
+def _validate_smart(cfg: RouterConfig) -> None:
+    """Cross-field checks for the smart picker settings.
+
+    A smart alias that collides with a real model id (or a configured alias)
+    is only a warning: exact ids always win over smart aliases by design, so
+    the model stays reachable — but the user probably didn't intend it."""
+    if cfg.routing_mode != "smart":
+        return
+    known_ids = {m.id for m in cfg.models}
+    for alias in cfg.smart.aliases:
+        if alias in known_ids:
+            log.warning(
+                "smart alias %r is also a configured model id; the exact model "
+                "wins, so this alias will never trigger smart selection",
+                alias,
+            )
+        if alias in (cfg.aliases or {}):
+            log.warning(
+                "smart alias %r is also a configured alias (-> %r); the "
+                "configured alias wins, so this alias will never trigger "
+                "smart selection",
+                alias,
+                cfg.aliases[alias],
+            )
 
 
 def _validate_aliases(cfg: RouterConfig) -> None:
@@ -881,6 +1278,13 @@ def config_json_schema() -> dict[str, Any]:
         ],
     }
 
+    _tier_schema = {
+        "anyOf": [
+            {"type": "integer", "minimum": 1, "maximum": 5},
+            {"type": "null"},
+        ],
+        "default": None,
+    }
     model_schema = {
         "type": "object",
         "properties": {
@@ -895,6 +1299,55 @@ def config_json_schema() -> dict[str, Any]:
                     "Inject chat_template_kwargs.enable_thinking=false on chat "
                     "requests whose max_tokens is below this, so a small budget "
                     "isn't eaten by the reasoning channel. null/omitted = off."
+                ),
+            },
+            "quality_tier": {
+                **_tier_schema,
+                "description": (
+                    "Optional coarse quality tier 1 (worst) .. 5 (best) for the "
+                    "smart picker; omitted = derive from benchmark priors."
+                ),
+            },
+            "speed_tier": {
+                **_tier_schema,
+                "description": (
+                    "Optional coarse speed tier 1 (slowest) .. 5 (fastest) for "
+                    "the smart picker; omitted = derive from model size."
+                ),
+            },
+            "memory_gb": {
+                "anyOf": [
+                    {"type": "number", "exclusiveMinimum": 0},
+                    {"type": "null"},
+                ],
+                "default": None,
+                "description": "Approximate loaded memory footprint in GB.",
+            },
+            "capabilities": {
+                "type": "array",
+                "items": {"type": "string", "enum": sorted(MODEL_CAPABILITIES)},
+                "description": (
+                    "What the model can do; empty = general chat model. Include "
+                    "'embedding' / 'vision' so the smart picker matches request "
+                    "shape."
+                ),
+            },
+            "strengths": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "number", "minimum": 0, "maximum": 1,
+                },
+                "description": (
+                    "Per-capability score overrides (0..1) that beat benchmark "
+                    "priors for the smart picker."
+                ),
+            },
+            "smart_enabled": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "Set false to exclude this model from smart selection (it "
+                    "stays routable by its exact id)."
                 ),
             },
         },
@@ -929,9 +1382,100 @@ def config_json_schema() -> dict[str, Any]:
         "additionalProperties": False,
     }
 
+    _weight_table_schema = {
+        "type": "object",
+        "properties": {
+            key: {"type": "number", "minimum": 0} for key in sorted(SMART_WEIGHT_KEYS)
+        },
+        "additionalProperties": False,
+    }
+    smart_schema = {
+        "type": "object",
+        "description": (
+            "Smart model-picker settings; active when routing_mode is 'smart' "
+            "(the default). Absent = all defaults."
+        ),
+        "properties": {
+            "aliases": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": ["smart", "auto", "default"],
+                "description": "Request model ids that always trigger smart selection.",
+            },
+            "policy": {
+                "type": "string",
+                "default": "balanced",
+                "description": (
+                    "Active scoring policy: balanced | fast | quality | economy, "
+                    "or a custom name defined under policies."
+                ),
+            },
+            "policies": {
+                "type": "object",
+                "additionalProperties": _weight_table_schema,
+                "description": "Custom named policies (weight presets).",
+            },
+            "weights": {
+                **_weight_table_schema,
+                "description": (
+                    "Scoring-component weight overrides, merged over the "
+                    "active policy's weights."
+                ),
+            },
+            "catch_cloud_models": {"type": "boolean", "default": True},
+            "catch_unknown_models": {"type": "boolean", "default": True},
+            "override_exact_model_ids": {"type": "boolean", "default": False},
+            "swap_margin": {
+                "type": "number", "minimum": 0, "maximum": 1, "default": 0.08,
+                "description": (
+                    "Score advantage a non-resident model needs over the best "
+                    "resident candidate to justify an engine swap."
+                ),
+            },
+            "min_confidence": {
+                "type": "number", "minimum": 0, "maximum": 1, "default": 0.25,
+            },
+            "swap_cost_horizon_s": {"type": "number", "minimum": 0, "default": 180.0},
+            "retry": {
+                "type": "object",
+                "properties": {
+                    "same_model_reload": {"type": "boolean", "default": True},
+                    "fall_forward": {"type": "boolean", "default": True},
+                    "max_fallbacks": {"type": "integer", "minimum": 0, "default": 2},
+                    "failure_threshold": {"type": "integer", "minimum": 0, "default": 3},
+                    "cooldown_s": {"type": "number", "minimum": 0, "default": 120.0},
+                },
+                "additionalProperties": False,
+            },
+            "benchmarks": {
+                "type": "object",
+                "properties": {
+                    "enabled": {"type": "boolean", "default": True},
+                    "allow_network": {"type": "boolean", "default": False},
+                    "cache_ttl_s": {"type": "number", "minimum": 0, "default": 0.0},
+                },
+                "additionalProperties": False,
+            },
+            "calibration_enabled": {"type": "boolean", "default": True},
+        },
+        "additionalProperties": False,
+    }
+
     root = _schema_for_dataclass(
-        RouterConfig, exclude=("ds4", "ollama", "engines", "models", "discover")
+        RouterConfig,
+        exclude=("ds4", "ollama", "engines", "models", "discover", "smart"),
     )
+    root["properties"]["routing_mode"] = {
+        "type": "string",
+        "enum": sorted(ROUTING_MODES),
+        "default": "smart",
+        "description": (
+            "'smart' (default): the picker chooses the best local model for "
+            "smart aliases / cloud names / unknown ids. 'manual': exact "
+            "model-id routing only."
+        ),
+    }
+    root["properties"]["smart"] = smart_schema
     root["properties"]["ds4"] = ds4_schema
     root["properties"]["ollama"] = ollama_schema
     root["properties"]["engines"] = {

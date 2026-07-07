@@ -24,6 +24,42 @@ log_level: INFO
 log_file: ./logs/router.log
 state_file: ./state.json
 
+# --- Routing mode ------------------------------------------------------------
+# smart (default): requests for a smart alias ("smart", "auto", "default"), a
+# well-known cloud model name (gpt-*, claude-*, gemini-*, ...), or an unknown
+# model id go through the smart picker, which chooses the best local model for
+# the request — combining benchmark priors, local calibration, context fit,
+# observed reliability, and (crucially) whether the strongest model is worth
+# unloading the current engine, waiting for memory reclaim, and cold-starting
+# another backend. Exact model ids below ALWAYS route exactly.
+# manual: exact model-id routing only (the pre-0.7 behaviour).
+# Toggle any time with `routerctl smart` / `routerctl manual`.
+routing_mode: smart
+
+# --- Smart picker (optional; all defaults shown) -----------------------------
+# smart:
+#   aliases: [smart, auto, default]  # request ids that always trigger the picker
+#   policy: balanced                 # balanced | fast | quality | economy
+#   catch_cloud_models: true         # route gpt-*/claude-*/... through the picker
+#   catch_unknown_models: true       # route unknown ids through the picker
+#   override_exact_model_ids: false  # exact ids stay manual unless true
+#   swap_margin: 0.08                # score gain required to justify an engine swap
+#   min_confidence: 0.25             # below this, prefer the resident model
+#   swap_cost_horizon_s: 180         # swap seconds treated as "maximally expensive"
+#   weights: {}                      # override component weights, e.g. {quality: 0.6}
+#   policies: {}                     # define custom named policies
+#   retry:
+#     same_model_reload: true        # retry the pick once after an engine reload
+#     fall_forward: true             # then try the next-ranked compatible model
+#     max_fallbacks: 2
+#     failure_threshold: 3           # consecutive failures before cooldown
+#     cooldown_s: 120
+#   benchmarks:
+#     enabled: true                  # use public-benchmark priors for scoring
+#     allow_network: false           # builtin priors are offline; network sync is opt-in
+#     cache_ttl_s: 0                 # 0 = cache forever; refresh via `routerctl benchmarks refresh`
+#   calibration_enabled: true        # allow `POST /admin/smart/calibrate` smoke probes
+
 # SSE keep-alive comments keep streaming clients alive during a (possibly slow)
 # engine swap so they don't hit an idle/first-token timeout.
 swap_keepalive_enabled: true
@@ -114,7 +150,16 @@ engines:
 
 # Static model->engine registry. The `id` must match what clients send, and
 # `engine` must name a configured engine above. Unknown ids fall back to a live
-# Ollama tag lookup.
+# Ollama tag lookup (or, in smart mode, to the smart picker).
+#
+# Optional per-model smart-picker metadata (all omitted = derived from
+# benchmark priors / model identity / observed runtime stats):
+#   quality_tier: 4          # coarse quality, 1 (worst) .. 5 (best)
+#   speed_tier: 3            # coarse speed, 1 (slowest) .. 5 (fastest)
+#   memory_gb: 6.5           # approximate loaded footprint
+#   capabilities: [coding]   # add "embedding" / "vision" for those model types
+#   strengths: {coding: 0.9} # per-capability score overrides (0..1) that beat priors
+#   smart_enabled: true      # false = keep out of smart selection entirely
 models:
   - id: qwen2.5-7b-instruct
     engine: llamacpp

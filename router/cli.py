@@ -18,8 +18,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from typing import Any
@@ -119,6 +121,21 @@ def _conn_error(exc: Exception) -> None:
 def _print_status(st: dict) -> None:
     active = st.get("active_engine")
     print(f"active engine : {active or '(none)'}")
+    mode = st.get("routing_mode")
+    if mode:
+        smart = st.get("smart") or {}
+        policy = smart.get("policy")
+        line = f"routing mode  : {mode}"
+        if mode == "smart" and policy:
+            line += f" (policy: {policy})"
+        print(line)
+        pick = smart.get("last_pick")
+        if mode == "smart" and pick:
+            print(
+                f"last pick     : {pick.get('requested_model')} -> "
+                f"{pick.get('model')} on {pick.get('engine')} "
+                f"(conf {pick.get('confidence')})"
+            )
     last = st.get("last_swap")
     if last:
         ok_str = "OK" if last.get("ok") else "FAILED"
@@ -297,6 +314,162 @@ def cmd_explain(args: argparse.Namespace) -> None:
             print(f"  {note}")
 
 
+def _config_path() -> str:
+    return os.environ.get("ROUTER_CONFIG", os.path.join(_REPO_ROOT, "config.yaml"))
+
+
+def _validate_config_text(text: str) -> None:
+    """Raise ValueError if *text* is not a valid router config (real loader)."""
+    from .config import load_config
+
+    fd, tmp = tempfile.mkstemp(suffix=".yaml", prefix="routerctl-")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        load_config(tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def cmd_set_mode(mode: str) -> None:
+    """`routerctl smart` / `routerctl manual`: persist routing_mode in the
+    config file (validated before writing) and apply it to the running router
+    via POST /admin/smart/mode so no restart is needed."""
+    path = _config_path()
+    updated_file = False
+    if os.path.exists(path):
+        with open(path) as fh:
+            text = fh.read()
+        if re.search(r"(?m)^routing_mode\s*:", text):
+            new_text = re.sub(
+                r"(?m)^routing_mode\s*:.*$", f"routing_mode: {mode}", text, count=1
+            )
+        else:
+            new_text = text.rstrip("\n") + (
+                f"\n\n# Routing mode: smart (picker chooses the best local model"
+                f" for smart\n# aliases / cloud names / unknown ids) or manual"
+                f" (exact ids only).\nrouting_mode: {mode}\n"
+            )
+        try:
+            _validate_config_text(new_text)
+        except ValueError as exc:
+            print(f"refusing to write {path}: config would be invalid: {exc}",
+                  file=sys.stderr)
+            sys.exit(1)
+        with open(path, "w") as fh:
+            fh.write(new_text)
+        updated_file = True
+        print(f"config updated: routing_mode: {mode}  ({path})")
+    else:
+        print(
+            f"note: config file not found at {path}; changing the runtime mode "
+            "only (a restart will revert to the config default)",
+            file=sys.stderr,
+        )
+    # Best-effort live apply; the config edit above already covers restarts.
+    try:
+        result = _post("/admin/smart/mode", {"mode": mode})
+        print(f"router routing mode is now: {result.get('routing_mode', mode)}")
+    except SystemExit:
+        if updated_file:
+            print("router not reachable; the mode applies on next start "
+                  "(routerctl restart)", file=sys.stderr)
+        else:
+            sys.exit(1)
+
+
+def cmd_explain_smart(args: argparse.Namespace) -> None:
+    """POST /admin/smart/resolve and print the full smart-picker diagnostics."""
+    body: dict[str, Any] = {"model": args.model}
+    if getattr(args, "message", None):
+        body["messages"] = [{"role": "user", "content": args.message}]
+    if getattr(args, "endpoint", None):
+        body["endpoint"] = args.endpoint
+    result = _post("/admin/smart/resolve", body)
+
+    if not result.get("smart_selection"):
+        print(f"mode      : {result.get('mode')}")
+        print("smart pick: no")
+        print(f"reason    : {result.get('reason')}")
+        return
+
+    print(f"requested : {result.get('requested_model')}")
+    print(f"picked    : {result.get('model')}  on {result.get('engine')}")
+    print(f"policy    : {result.get('policy')}")
+    print(f"confidence: {result.get('confidence')}")
+    print(f"would swap: {str(bool(result.get('would_swap'))).lower()}"
+          f"  (est. cost {result.get('swap_cost_s')}s)")
+    job = result.get("job") or {}
+    if job:
+        top = sorted(job.items(), key=lambda kv: -kv[1])[:4]
+        print("job       : " + ", ".join(f"{k}={v:.2f}" for k, v in top))
+    for reason in result.get("reasons") or []:
+        print(f"  - {reason}")
+    candidates = result.get("candidates") or []
+    if candidates:
+        print("candidates:")
+        for c in candidates:
+            if c.get("excluded"):
+                print(f"  {c['model']}  ({c['engine']})  EXCLUDED: {c['excluded']}")
+            else:
+                comp = c.get("components") or {}
+                print(
+                    f"  {c['model']}  ({c['engine']})  total={c['total']}"
+                    f"  quality={comp.get('quality')}  swap_cost={c.get('swap_cost_s')}s"
+                    + ("  [resident]" if c.get("resident") else "")
+                )
+    fallbacks = result.get("fallbacks") or []
+    if fallbacks:
+        print("fallbacks : " + ", ".join(fallbacks))
+    benches = result.get("benchmarks") or []
+    if benches:
+        print("benchmark provenance:")
+        for b in benches:
+            print(
+                f"  {b.get('capability')}: {b.get('score')} "
+                f"({b.get('match')}, conf {b.get('confidence')}) "
+                f"— {b.get('benchmark')}"
+            )
+
+
+def cmd_benchmarks(args: argparse.Namespace) -> None:
+    """`routerctl benchmarks refresh|show|clear [model]`."""
+    action = args.action
+    model = getattr(args, "model", None)
+    if action == "refresh":
+        body = {"model": model} if model else {}
+        result = _post("/admin/benchmarks/refresh", body, timeout=60.0)
+        refreshed = result.get("refreshed") or []
+        print(f"refreshed {result.get('count', len(refreshed))} model(s)")
+        for canonical in refreshed:
+            print(f"  {canonical}")
+    elif action == "clear":
+        body = {"model": model} if model else {}
+        result = _post("/admin/benchmarks/clear", body)
+        print(f"cleared {result.get('cleared', 0)} cache entr(y/ies)")
+    else:  # show
+        result = _get("/admin/benchmarks")
+        models = result.get("models") or {}
+        print(
+            f"benchmark cache: {result.get('cached_models', len(models))} model(s); "
+            f"providers: "
+            + ", ".join(p.get("name", "?") for p in result.get("providers") or [])
+        )
+        for canonical, entry in models.items():
+            if model and model not in (canonical, *entry.get("raw_ids", [])):
+                continue
+            print(f"[{canonical}]  (seen as: {', '.join(entry.get('raw_ids') or ['-'])})")
+            for rec in entry.get("records") or []:
+                print(
+                    f"  {rec.get('capability'):<16} {rec.get('score'):<7} "
+                    f"conf={rec.get('confidence')} {rec.get('match')} "
+                    f"src={rec.get('source')}"
+                )
+
+
 def cmd_service(args: argparse.Namespace) -> None:
     action = args.action
     # The router is a *user* unit, so no sudo and the --user flag.
@@ -334,8 +507,32 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("discover", help="scan all engines for discoverable models (POST /admin/discover)")
     sub.add_parser("catalog", help="show the merged router model catalog")
     sub.add_parser("refresh", help="refresh the model catalog now")
-    explain_p = sub.add_parser("explain", help="explain how a model id would route")
-    explain_p.add_argument("model", help="model id or alias to resolve")
+    explain_p = sub.add_parser(
+        "explain",
+        help="explain how a model id would route; with 'smart' (or --message) "
+             "shows the full smart-picker decision",
+    )
+    explain_p.add_argument("model", help="model id, alias, or 'smart'")
+    explain_p.add_argument(
+        "--message", help="sample user message to classify (smart explain)"
+    )
+    explain_p.add_argument(
+        "--endpoint", help="endpoint to classify for (default /v1/chat/completions)"
+    )
+
+    sub.add_parser(
+        "smart",
+        help="enable smart routing mode (config + running router)",
+    )
+    sub.add_parser(
+        "manual",
+        help="disable smart routing: exact model-id routing only",
+    )
+    bench_p = sub.add_parser(
+        "benchmarks", help="manage the benchmark cache: refresh | show | clear"
+    )
+    bench_p.add_argument("action", choices=["refresh", "show", "clear"])
+    bench_p.add_argument("model", nargs="?", help="limit to one model id")
     sub.add_parser("health", help="check router liveness (GET /health)")
     sub.add_parser("logs", help="tail the router log (journalctl or file fallback)")
 
@@ -380,7 +577,16 @@ def main() -> None:
     elif cmd == "refresh":
         cmd_refresh(args)
     elif cmd == "explain":
-        cmd_explain(args)
+        if args.model == "smart" or getattr(args, "message", None):
+            cmd_explain_smart(args)
+        else:
+            cmd_explain(args)
+    elif cmd == "smart":
+        cmd_set_mode("smart")
+    elif cmd == "manual":
+        cmd_set_mode("manual")
+    elif cmd == "benchmarks":
+        cmd_benchmarks(args)
     elif cmd == "use":
         cmd_use(args)
     elif cmd == "health":
