@@ -232,6 +232,10 @@ def cmd_logs(_args: argparse.Namespace) -> None:
 def cmd_discover(_args: argparse.Namespace) -> None:
     """POST /admin/discover and print per-engine discovered model ids."""
     result = _post("/admin/discover", {})
+    _print_catalog_engines(result)
+
+
+def _print_catalog_engines(result: dict) -> None:
     engines = result.get("engines") or {}
     if not engines:
         print("(no engines reported)")
@@ -243,6 +247,54 @@ def cmd_discover(_args: argparse.Namespace) -> None:
                 print(f"  {mid}")
         else:
             print("  (none)")
+
+
+def cmd_catalog(_args: argparse.Namespace) -> None:
+    """GET /admin/catalog and print the merged catalog."""
+    result = _get("/admin/catalog")
+    models = result.get("models") or []
+    if not models:
+        print("(catalog is empty)")
+        return
+    for m in models:
+        parts = [m.get("id", "")]
+        if m.get("engine"):
+            parts.append(f"({m['engine']})")
+        if m.get("source"):
+            parts.append(f"source={m['source']}")
+        if m.get("resolved_model"):
+            parts.append(f"-> {m['resolved_model']}")
+        if m.get("stale"):
+            parts.append("stale")
+        print("  " + "  ".join(parts))
+        for note in m.get("collisions") or []:
+            print(f"    collision: {note}")
+
+
+def cmd_refresh(_args: argparse.Namespace) -> None:
+    """POST /admin/discover and print the refreshed catalog by engine."""
+    result = _post("/admin/discover", {})
+    _print_catalog_engines(result)
+
+
+def cmd_explain(args: argparse.Namespace) -> None:
+    """POST /admin/resolve for a model id and print routing diagnostics."""
+    result = _post("/admin/resolve", {"model": args.model})
+    print(f"requested : {result.get('requested_model')}")
+    print(f"resolved  : {result.get('resolved_model')}")
+    print(f"engine    : {result.get('engine') or '(none)'}")
+    print(f"source    : {result.get('source') or '(none)'}")
+    print(f"would swap: {str(bool(result.get('would_swap'))).lower()}")
+    reasons = result.get("reasons") or []
+    if reasons:
+        print("reasons:")
+        for reason in reasons:
+            print(f"  {reason}")
+    collisions = result.get("collisions") or []
+    if collisions:
+        print("collisions:")
+        for note in collisions:
+            print(f"  {note}")
 
 
 def cmd_service(args: argparse.Namespace) -> None:
@@ -280,6 +332,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="show active engine and in-flight counts")
     sub.add_parser("models", help="list all known models (id, engine, name)")
     sub.add_parser("discover", help="scan all engines for discoverable models (POST /admin/discover)")
+    sub.add_parser("catalog", help="show the merged router model catalog")
+    sub.add_parser("refresh", help="refresh the model catalog now")
+    explain_p = sub.add_parser("explain", help="explain how a model id would route")
+    explain_p.add_argument("model", help="model id or alias to resolve")
     sub.add_parser("health", help="check router liveness (GET /health)")
     sub.add_parser("logs", help="tail the router log (journalctl or file fallback)")
 
@@ -319,6 +375,12 @@ def main() -> None:
         cmd_models(args)
     elif cmd == "discover":
         cmd_discover(args)
+    elif cmd == "catalog":
+        cmd_catalog(args)
+    elif cmd == "refresh":
+        cmd_refresh(args)
+    elif cmd == "explain":
+        cmd_explain(args)
     elif cmd == "use":
         cmd_use(args)
     elif cmd == "health":

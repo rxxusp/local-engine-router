@@ -510,6 +510,14 @@
           ],
           "default": "config_order"
         },
+        "refresh_interval_s": {
+          "type": "number",
+          "default": 300.0
+        },
+        "state_ttl_s": {
+          "type": "number",
+          "default": 2592000.0
+        },
         "port_probe": {
           "type": "object",
           "properties": {

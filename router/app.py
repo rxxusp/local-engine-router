@@ -333,35 +333,16 @@ def create_app(cfg: RouterConfig) -> FastAPI:
             )
 
         if cfg.discover.enabled:
-            # Discovery ON: query every engine's available_models() union and
-            # surface any stopped-engine ids from the discovery index.
-            # Best-effort: one try/except per engine so a single slow or broken
-            # engine cannot fail the whole listing.
-            for engine_key, engine in manager.engines.items():
-                try:
-                    tags = await engine.available_models()
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("could not fetch models from engine %r for /v1/models: %s",
-                                engine_key, exc)
+            # Discovery ON: the durable catalog owns model merging and collision
+            # handling. Refresh here to preserve the prior behavior where
+            # /v1/models queried live engines best-effort on demand.
+            await manager.refresh_catalog()
+            for item in manager.catalog.openai_models(_MODELS_CREATED_TS):
+                if item["id"] in seen:
                     continue
-                for tag in sorted(tags):
-                    if tag not in seen:
-                        seen.add(tag)
-                        data.append(
-                            {
-                                "id": tag,
-                                "object": "model",
-                                "created": _MODELS_CREATED_TS,
-                                "owned_by": engine_key,
-                                "name": tag,
-                            }
-                        )
-
-            # Surface any stopped-engine discovered ids (start_cmd parse,
-            # last-seen cache, or served_models) so a down engine's models
-            # still appear here.
-            disc = manager._discovered_index()
-            for model_id, engine_key in disc.items():
+                seen.add(item["id"])
+                data.append(item)
+            for model_id, engine_key in manager._discovered_index().items():
                 if model_id not in seen:
                     seen.add(model_id)
                     data.append(
@@ -400,40 +381,97 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         return JSONResponse({"object": "list", "data": data})
 
     # -----------------------------------------------------------------------
-    # Admin: trigger discovery scan — returns per-engine model lists
+    # Admin: catalog inspection and discovery refresh
     # -----------------------------------------------------------------------
+
+    @app.get("/admin/catalog")
+    async def admin_catalog(request: Request) -> JSONResponse:
+        manager: EngineManager = request.app.state.manager
+        return JSONResponse(manager.catalog.summary())
+
+    @app.post("/admin/resolve")
+    async def admin_resolve(request: Request) -> JSONResponse:
+        manager: EngineManager = request.app.state.manager
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                _openai_error("request body must be JSON", "invalid_request_error"),
+                status_code=400,
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                _openai_error("request body must be a JSON object", "invalid_request_error"),
+                status_code=400,
+            )
+        model = body.get("model")
+        if not model:
+            return JSONResponse(
+                _openai_error("missing required field: 'model'", "invalid_request_error"),
+                status_code=400,
+            )
+        try:
+            return JSONResponse(await manager.explain_model(str(model)))
+        except EngineError as exc:
+            return JSONResponse(
+                _openai_error(str(exc), "engine_error"),
+                status_code=_error_status_for(exc),
+            )
 
     @app.post("/admin/discover")
     async def admin_discover(request: Request) -> JSONResponse:
-        """Return a per-engine summary of discoverable model ids.
-
-        Calls available_models() on every engine (best-effort, one try/except
-        per engine). Also merges in the stopped-engine map from
-        manager._discovered_index() (empty when discovery is disabled).
-        Auth-gated identically to /admin/swap.
-        """
+        """Refresh and return the merged model catalog."""
         manager: EngineManager = request.app.state.manager
-        engines_out: dict[str, list[str]] = {}
-
-        for engine_key, engine in manager.engines.items():
-            try:
-                ids = await engine.available_models()
+        if not cfg.discover.enabled:
+            engines_out: dict[str, list[str]] = {}
+            models_out: list[dict[str, Any]] = []
+            for engine_key, engine in manager.engines.items():
+                try:
+                    ids = await engine.available_models()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("discover: engine %r available_models failed: %s",
+                                engine_key, exc)
+                    ids = set()
                 engines_out[engine_key] = sorted(ids)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("discover: engine %r available_models failed: %s",
-                            engine_key, exc)
-                engines_out[engine_key] = []
-
-        # Merge in any stopped-engine entries from the discovery index
-        # (empty when discovery is disabled).
-        disc = manager._discovered_index()
-        for model_id, engine_key in disc.items():
-            bucket = engines_out.setdefault(engine_key, [])
+                for model_id in sorted(ids):
+                    models_out.append(
+                        {
+                            "id": model_id,
+                            "engine": engine_key,
+                            "source": "live",
+                            "stale": False,
+                            "collisions": [],
+                        }
+                    )
+            for model_id, engine_key in manager._discovered_index().items():
+                bucket = engines_out.setdefault(engine_key, [])
+                if model_id not in bucket:
+                    bucket.append(model_id)
+                    bucket.sort()
+                    models_out.append(
+                        {
+                            "id": model_id,
+                            "engine": engine_key,
+                            "source": "discovered",
+                            "stale": False,
+                            "collisions": [],
+                        }
+                    )
+            return JSONResponse(
+                {
+                    "enabled": False,
+                    "collision": cfg.discover.collision,
+                    "engines": engines_out,
+                    "models": models_out,
+                }
+            )
+        summary = await manager.refresh_catalog()
+        for model_id, engine_key in manager._discovered_index().items():
+            bucket = summary.setdefault("engines", {}).setdefault(engine_key, [])
             if model_id not in bucket:
                 bucket.append(model_id)
                 bucket.sort()
-
-        return JSONResponse({"engines": engines_out})
+        return JSONResponse(summary)
 
     # -----------------------------------------------------------------------
     # Admin: force swap

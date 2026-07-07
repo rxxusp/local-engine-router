@@ -287,6 +287,12 @@ class DiscoverConfig:
     # How to handle a model id found on multiple engines simultaneously.
     #   "config_order"  -> the engine that appears first in the engines: table wins
     collision: str = "config_order"
+    # Background refresh cadence for the durable catalog when discovery is on.
+    # Zero disables the periodic loop while still allowing startup/manual refresh.
+    refresh_interval_s: float = 300.0
+    # How long persisted catalog entries are trusted after last_seen. Zero means
+    # never expire persisted entries.
+    state_ttl_s: float = 2_592_000.0
     # Port probe sub-section (parsed from a nested ``port_probe:`` mapping).
     port_probe_enabled: bool = False
 
@@ -503,7 +509,7 @@ def _validate_engine_params(key: str, etype: str, params: Any) -> None:
 
 _DISCOVER_VALID_COLLISION: frozenset[str] = frozenset({"config_order"})
 _DISCOVER_KNOWN_KEYS: frozenset[str] = frozenset(
-    {"enabled", "collision", "port_probe"}
+    {"enabled", "collision", "refresh_interval_s", "state_ttl_s", "port_probe"}
 )
 _DISCOVER_PORT_PROBE_KNOWN_KEYS: frozenset[str] = frozenset({"enabled"})
 
@@ -550,8 +556,26 @@ def _parse_discover_section(raw_discover: Any) -> DiscoverConfig:
     return DiscoverConfig(
         enabled=bool(raw_discover.get("enabled", False)),
         collision=collision,
+        refresh_interval_s=_parse_nonnegative_float(
+            raw_discover.get("refresh_interval_s", DiscoverConfig.refresh_interval_s),
+            "discover.refresh_interval_s",
+        ),
+        state_ttl_s=_parse_nonnegative_float(
+            raw_discover.get("state_ttl_s", DiscoverConfig.state_ttl_s),
+            "discover.state_ttl_s",
+        ),
         port_probe_enabled=port_probe_enabled,
     )
+
+
+def _parse_nonnegative_float(value: Any, field_name: str) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{field_name} must be a number (got {value!r})")
+    if out < 0:
+        raise ConfigError(f"{field_name} must be >= 0 (got {value!r})")
+    return out
 
 
 def _validate_generic_process_fields(key: str, params: GenericProcessConfig) -> None:
@@ -892,6 +916,8 @@ def config_json_schema() -> dict[str, Any]:
                 "enum": ["config_order"],
                 "default": "config_order",
             },
+            "refresh_interval_s": {"type": "number", "default": 300.0},
+            "state_ttl_s": {"type": "number", "default": 2_592_000.0},
             "port_probe": {
                 "type": "object",
                 "properties": {

@@ -142,6 +142,8 @@ models:
 #   enabled: false           # master switch; discovery is a no-op unless true
 #   collision: config_order  # how to handle a model id found on multiple engines
 #                            # (only "config_order" is implemented: first engine wins)
+#   refresh_interval_s: 300  # background catalog refresh cadence; 0 disables the loop
+#   state_ttl_s: 2592000     # persisted catalog entry TTL; 0 means never expire
 #   port_probe:
 #     enabled: false         # probe local ports for running backends (future)
 

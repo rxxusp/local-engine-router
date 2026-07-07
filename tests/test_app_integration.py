@@ -610,6 +610,33 @@ async def test_admin_discover_returns_per_engine_summary(mock_upstream):
         # Our fake engine must be present with its models sorted.
         assert "fake-x" in engines
         assert sorted(engines["fake-x"]) == ["mx1", "mx2"]
+        assert any(m["id"] == "mx1" for m in body["models"])
+
+
+async def test_admin_catalog_returns_merged_catalog(mock_upstream):
+    cfg = _app_config_discover_on(mock_upstream.base_url)
+    async with _client_for(cfg) as (client, _):
+        r = await client.get("/admin/catalog")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["enabled"] is True
+        ids = {m["id"] for m in body["models"]}
+        assert "deepseek-v4-flash" in ids
+
+
+async def test_admin_resolve_explains_alias_route(mock_upstream):
+    cfg = _app_config(
+        mock_upstream.base_url,
+        aliases={"chat": "deepseek-v4-flash"},
+    )
+    async with _client_for(cfg) as (client, _):
+        r = await client.post("/admin/resolve", json={"model": "chat"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["requested_model"] == "chat"
+        assert body["resolved_model"] == "deepseek-v4-flash"
+        assert body["engine"] == "ds4"
+        assert body["would_swap"] is True
 
 
 async def test_admin_discover_best_effort_broken_engine(mock_upstream):

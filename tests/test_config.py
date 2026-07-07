@@ -367,6 +367,8 @@ class TestDiscoverConfig:
         assert isinstance(d, DiscoverConfig)
         assert d.enabled is False
         assert d.collision == "config_order"
+        assert d.refresh_interval_s == 300.0
+        assert d.state_ttl_s == 2_592_000.0
         assert d.port_probe_enabled is False
 
     def test_discover_block_parsed(self, tmp_path):
@@ -376,6 +378,8 @@ class TestDiscoverConfig:
             discover:
               enabled: true
               collision: config_order
+              refresh_interval_s: 120
+              state_ttl_s: 3600
               port_probe:
                 enabled: true
             """,
@@ -384,6 +388,8 @@ class TestDiscoverConfig:
         d = cfg.discover
         assert d.enabled is True
         assert d.collision == "config_order"
+        assert d.refresh_interval_s == 120.0
+        assert d.state_ttl_s == 3600.0
         assert d.port_probe_enabled is True
 
     def test_discover_partial_override_uses_defaults_for_rest(self, tmp_path):
@@ -399,7 +405,31 @@ class TestDiscoverConfig:
         assert d.enabled is True
         # Unspecified keys fall back to DiscoverConfig defaults.
         assert d.collision == "config_order"
+        assert d.refresh_interval_s == 300.0
+        assert d.state_ttl_s == 2_592_000.0
         assert d.port_probe_enabled is False
+
+    def test_refresh_interval_must_be_nonnegative(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            discover:
+              refresh_interval_s: -1
+            """,
+        )
+        with pytest.raises(ConfigError, match="refresh_interval_s"):
+            load_config(path)
+
+    def test_state_ttl_must_be_numeric(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+            discover:
+              state_ttl_s: nope
+            """,
+        )
+        with pytest.raises(ConfigError, match="state_ttl_s"):
+            load_config(path)
 
     def test_unknown_key_under_discover_raises(self, tmp_path):
         path = _write(
@@ -552,6 +582,8 @@ class TestSchemaNewFields:
         assert d["type"] == "object"
         assert "enabled" in d["properties"]
         assert "collision" in d["properties"]
+        assert "refresh_interval_s" in d["properties"]
+        assert "state_ttl_s" in d["properties"]
         assert "port_probe" in d["properties"]
         assert "augment_only" not in d["properties"]
         assert d["properties"]["collision"]["enum"] == ["config_order"]

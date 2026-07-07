@@ -494,6 +494,8 @@ you set `discover: enabled: true` in `config.yaml`.
 discover:
   enabled: false            # opt-in; false is the safe default
   collision: config_order   # how to resolve engine conflicts (only mode today)
+  refresh_interval_s: 300   # background catalog refresh cadence; 0 disables the loop
+  state_ttl_s: 2592000      # persisted catalog entry TTL; 0 means never expire
   port_probe:
     enabled: false          # reserved for future use; parse-validated, not yet active
 ```
@@ -540,8 +542,12 @@ Discovery **augments** the static `models:` list. It never overrides it.
   This means a model belonging to a stopped engine still appears in
   `GET /v1/models` and routes correctly when requested (triggering a start).
 
-The last-seen cache is persisted in `state.json` under `seen_models` and
-reloaded on startup, so discovery survives router restarts.
+The merged catalog is persisted in `state.json` under `catalog` with per-model
+metadata (`engine`, `source`, `first_seen`, `last_seen`, `last_live_status`, and
+collision notes). A legacy `seen_models` map is still written for compatibility.
+The catalog is refreshed on startup, after successful swaps, by
+`POST /admin/discover`, and every `discover.refresh_interval_s` seconds while
+discovery is enabled.
 
 ### Per-model thinking guard
 
@@ -576,12 +582,16 @@ curl -X POST http://127.0.0.1:8077/admin/discover \
 routerctl discover
 ```
 
-The response is a JSON object mapping each engine key to the sorted list of
-model ids it advertised. Stopped-engine entries from the discovery index (parsed
-from `start_cmd`, last-seen cache, and `served_models`) are merged in.
+The response includes both `engines` (engine key to sorted model ids) and
+`models` (the full merged catalog). Stopped-engine entries from the discovery
+index (parsed from `start_cmd`, persisted catalog state, and `served_models`) are
+merged in.
 
-`POST /admin/discover` is a scan-and-report call. It does not change routing; it
-is intended for inspection and debugging.
+`POST /admin/discover` refreshes catalog metadata but does not swap engines.
+For diagnostics, `GET /admin/catalog` returns the current merged catalog and
+`POST /admin/resolve` with `{"model":"<id>"}` explains alias resolution,
+selected engine, catalog source, whether a swap would occur, and any collision
+notes.
 
 
 ## Endpoint reference
@@ -604,7 +614,9 @@ is intended for inspection and debugging.
 | POST | `/api/embed` | Ollama-native embed; routed by `body.model` |
 | GET/POST | `/api/tags`, `/api/ps`, `/api/version`, `/api/show`, `/api/pull`, `/api/*` | Passthrough to Ollama, no swap. Destructive endpoints refused with 403 unless `allow_destructive_ollama_api: true`. |
 | POST | `/admin/swap` | Body: `{"model":"<id>"}` or `{"engine":"<key>"}`. Proactive swap without a user request. |
-| POST | `/admin/discover` | Scan all engines for discoverable model ids and return a per-engine summary. Auth-gated the same as `/admin/swap`. |
+| GET | `/admin/catalog` | Return the merged runtime model catalog. Auth-gated the same as `/admin/swap`. |
+| POST | `/admin/resolve` | Body: `{"model":"<id>"}`. Explain alias/catalog/fallback routing for a model without swapping. |
+| POST | `/admin/discover` | Refresh the catalog and return the merged catalog plus per-engine summary. Auth-gated the same as `/admin/swap`. |
 
 
 ## Metrics
@@ -628,9 +640,12 @@ dependency -- the exposition is hand-rolled.
 ```bash
 routerctl status                    # active engine, in-flight, last swap
 routerctl models                    # list all known models
+routerctl catalog                   # show merged catalog entries with sources
+routerctl refresh                   # refresh the catalog now
+routerctl explain qwen2.5-7b-instruct  # explain route, alias, and swap decision
 routerctl use llamacpp              # swap to a specific engine now
 routerctl use qwen2.5-7b-instruct   # or name a model; swaps to its owning engine
-routerctl discover                  # POST /admin/discover: scan engines, print per-engine model ids
+routerctl discover                  # compatibility alias: refresh and print per-engine model ids
 routerctl logs                      # tail the service journal
 routerctl restart                   # restart the service
 ```

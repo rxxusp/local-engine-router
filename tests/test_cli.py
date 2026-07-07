@@ -82,6 +82,38 @@ _MODELS_PAYLOAD = {
 
 _HEALTH_PAYLOAD = {"status": "ok"}
 
+_CATALOG_PAYLOAD = {
+    "enabled": True,
+    "engines": {"ds4": ["deepseek-v4-flash"], "ollama": ["qwen3:3b"]},
+    "models": [
+        {
+            "id": "deepseek-v4-flash",
+            "engine": "ds4",
+            "source": "static",
+            "stale": False,
+            "collisions": [],
+        },
+        {
+            "id": "chat",
+            "engine": "ds4",
+            "source": "alias",
+            "resolved_model": "deepseek-v4-flash",
+            "stale": False,
+            "collisions": [],
+        },
+    ],
+}
+
+_RESOLVE_PAYLOAD = {
+    "requested_model": "chat",
+    "resolved_model": "deepseek-v4-flash",
+    "engine": "ds4",
+    "source": "alias",
+    "would_swap": True,
+    "reasons": ["alias 'chat' resolves to 'deepseek-v4-flash'"],
+    "collisions": [],
+}
+
 
 # --------------------------------------------------------------------------- #
 # Parser tests — argument parsing only, no I/O
@@ -106,6 +138,19 @@ class TestBuildParser:
     def test_logs_subcommand_parsed(self):
         args = self._p().parse_args(["logs"])
         assert args.command == "logs"
+
+    def test_catalog_subcommand_parsed(self):
+        args = self._p().parse_args(["catalog"])
+        assert args.command == "catalog"
+
+    def test_refresh_subcommand_parsed(self):
+        args = self._p().parse_args(["refresh"])
+        assert args.command == "refresh"
+
+    def test_explain_subcommand_parses_model(self):
+        args = self._p().parse_args(["explain", "chat"])
+        assert args.command == "explain"
+        assert args.model == "chat"
 
     def test_use_subcommand_parses_target(self):
         args = self._p().parse_args(["use", "ds4"])
@@ -199,6 +244,58 @@ class TestCmdModels:
         out = capsys.readouterr().out
         assert "deepseek-v4-flash" in out
         assert "qwen3:3b" in out
+
+
+class TestCmdCatalog:
+    def test_gets_catalog_path(self, monkeypatch):
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return _FakeResponse(_CATALOG_PAYLOAD)
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        cli.cmd_catalog(argparse.Namespace())
+
+        assert captured[0].full_url.endswith("/admin/catalog")
+        assert captured[0].method == "GET"
+
+    def test_prints_catalog_model_ids(self, monkeypatch, capsys):
+        monkeypatch.setattr(urllib.request, "urlopen", _make_urlopen(_CATALOG_PAYLOAD))
+        cli.cmd_catalog(argparse.Namespace())
+        out = capsys.readouterr().out
+        assert "deepseek-v4-flash" in out
+        assert "chat" in out
+
+
+class TestCmdRefreshExplain:
+    def test_refresh_posts_to_admin_discover(self, monkeypatch):
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return _FakeResponse(_CATALOG_PAYLOAD)
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        cli.cmd_refresh(argparse.Namespace())
+
+        assert captured[0].full_url.endswith("/admin/discover")
+        assert captured[0].method == "POST"
+
+    def test_explain_posts_to_admin_resolve(self, monkeypatch, capsys):
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return _FakeResponse(_RESOLVE_PAYLOAD)
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        cli.cmd_explain(argparse.Namespace(model="chat"))
+
+        assert captured[0].full_url.endswith("/admin/resolve")
+        assert captured[0].method == "POST"
+        assert json.loads(captured[0].data.decode()) == {"model": "chat"}
+        assert "deepseek-v4-flash" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------- #

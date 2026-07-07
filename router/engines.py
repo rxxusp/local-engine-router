@@ -54,6 +54,7 @@ import psutil
 
 from . import metrics
 from . import sysmem
+from .catalog import ModelCatalog
 from .config import RouterConfig, build_model_index
 
 log = logging.getLogger("router.engines")
@@ -1214,7 +1215,9 @@ class EngineManager:
         # holds weak refs, so an unanchored task can be garbage-collected
         # mid-flight and silently drop the snapshot.
         self._bg_tasks: set[asyncio.Task] = set()
-        self._load_seen_models_from_state()
+        self.catalog = ModelCatalog(cfg, self.engines)
+        self._seen_models.update(self.catalog.seen_models())
+        self._refresh_task: asyncio.Task | None = None
 
     # -- discovery helpers ---------------------------------------------- #
     def _load_seen_models_from_state(self) -> None:
@@ -1233,6 +1236,94 @@ class EngineManager:
         except (OSError, ValueError, AttributeError):
             pass  # missing file, bad JSON, wrong types — all fine
 
+    async def refresh_catalog(self) -> dict[str, Any]:
+        """Refresh and persist the runtime model catalog."""
+        self.catalog.engines = self.engines
+        summary = await self.catalog.refresh()
+        self._seen_models.update(self.catalog.seen_models())
+        self._persist()
+        return summary
+
+    async def explain_model(self, model_id: str | None) -> dict[str, Any]:
+        """Explain how a model id would resolve without swapping."""
+        if not model_id:
+            raise EngineError("request is missing a 'model' field")
+        real = self.resolve_model_id(model_id)
+        reasons: list[str] = []
+        if real != model_id:
+            reasons.append(f"alias {model_id!r} resolves to {real!r}")
+
+        spec = self.index.get(real)
+        if spec:
+            entry = self.catalog.resolve(model_id, active_engine=self.active_engine)
+            out = entry.to_dict()
+            out.update(
+                {
+                    "engine": spec.engine,
+                    "source": "static" if real == model_id else "alias",
+                    "would_swap": self.active_engine != spec.engine,
+                    "reasons": reasons or ["matched static model registry"],
+                }
+            )
+            return out
+
+        entry = self.catalog.resolve(model_id, active_engine=self.active_engine)
+        if entry.engine is not None:
+            return entry.to_dict()
+
+        for engine in self.engines.values():
+            if isinstance(engine, APISwapEngine):
+                tags = await engine.available_tags()
+                if real in tags:
+                    return {
+                        "requested_model": model_id,
+                        "resolved_model": real,
+                        "engine": engine.key,
+                        "source": "live",
+                        "would_swap": self.active_engine != engine.key,
+                        "reasons": reasons + ["matched live API-swap tag lookup"],
+                        "collisions": [],
+                    }
+
+        if len(self.engines) == 1:
+            engine = next(iter(self.engines.values()))
+            return {
+                "requested_model": model_id,
+                "resolved_model": real,
+                "engine": engine.key,
+                "source": "single_engine_fallback",
+                "would_swap": self.active_engine != engine.key,
+                "reasons": reasons + ["only one engine is enabled"],
+                "collisions": [],
+            }
+
+        for engine in self.engines.values():
+            if isinstance(engine, APISwapEngine):
+                return {
+                    "requested_model": model_id,
+                    "resolved_model": real,
+                    "engine": engine.key,
+                    "source": "api_swap_default",
+                    "would_swap": self.active_engine != engine.key,
+                    "reasons": reasons + ["unknown model defaults to API-swap engine"],
+                    "collisions": [],
+                }
+
+        return entry.to_dict()
+
+    async def _catalog_refresh_loop(self) -> None:
+        interval = float(getattr(self.cfg.discover, "refresh_interval_s", 0.0) or 0.0)
+        if interval <= 0:
+            return
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.refresh_catalog()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("catalog refresh failed: %s", exc)
+
     async def _snapshot_seen_models(self, engine: Engine) -> None:
         """Replace _seen_models[engine.key] with the current available_models().
 
@@ -1246,6 +1337,7 @@ class EngineManager:
             return
         if ids:
             self._seen_models[engine.key] = set(ids)
+            self.catalog.set_seen_models(engine.key, set(ids))
             self._persist()
 
     def _discovered_index(self) -> dict[str, str]:
@@ -1327,9 +1419,19 @@ class EngineManager:
         self.active_engine = active
         metrics.set_active_engine(active)
         log.info("startup: active engine detected as %s", self.active_engine)
+        if self.cfg.discover.enabled:
+            await self.refresh_catalog()
+            self._refresh_task = asyncio.create_task(self._catalog_refresh_loop())
         self._persist()
 
     async def aclose(self) -> None:
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._refresh_task = None
         for e in self.engines.values():
             await e.aclose()
 
@@ -1378,6 +1480,13 @@ class EngineManager:
             owner = self.engines.get(owner_key)
             if owner is not None:
                 return owner
+
+        if self.cfg.discover.enabled:
+            entry = self.catalog.owner_for(model_id)
+            if entry is not None:
+                engine = self.engines.get(entry.engine)
+                if engine is not None:
+                    return engine
 
         # A process engine advertises a small, fixed set; if model_id is one of
         # those, use that engine.
@@ -1619,7 +1728,9 @@ class EngineManager:
 
     def _persist(self) -> None:
         try:
-            os.makedirs(os.path.dirname(self.cfg.state_file), exist_ok=True)
+            state_dir = os.path.dirname(self.cfg.state_file)
+            if state_dir:
+                os.makedirs(state_dir, exist_ok=True)
             state: dict[str, Any] = {
                 "active_engine": self.active_engine,
                 "last_swap": self._last_swap,
@@ -1630,7 +1741,10 @@ class EngineManager:
                 state["seen_models"] = {
                     k: sorted(v) for k, v in self._seen_models.items() if v
                 }
-            with open(self.cfg.state_file, "w") as fh:
+                state["catalog"] = self.catalog.state_payload()
+            tmp = f"{self.cfg.state_file}.tmp"
+            with open(tmp, "w") as fh:
                 json.dump(state, fh)
+            os.replace(tmp, self.cfg.state_file)
         except OSError as exc:  # pragma: no cover - best effort
             log.debug("could not persist state: %s", exc)
