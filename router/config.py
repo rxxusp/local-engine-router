@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import math
 import os
 from dataclasses import MISSING, dataclass, field, fields
 from typing import Any
@@ -526,8 +527,10 @@ class RouterConfig:
 # --------------------------------------------------------------------------- #
 def _coerce_section(cls, data: dict[str, Any] | None, *, ctx: str | None = None):
     """Build a dataclass from a dict, ignoring unknown keys (forward-compat)."""
-    if not data:
+    if data is None:
         return cls()
+    if not isinstance(data, dict):
+        raise ConfigError(f"{ctx or cls.__name__} must be a mapping")
     known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
     unknown = set(data) - known
     if unknown:
@@ -698,10 +701,14 @@ def _parse_discover_section(raw_discover: Any) -> DiscoverConfig:
 
 
 def _parse_nonnegative_float(value: Any, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{field_name} must be a number, not a boolean")
     try:
         out = float(value)
     except (TypeError, ValueError):
         raise ConfigError(f"{field_name} must be a number (got {value!r})")
+    if not math.isfinite(out):
+        raise ConfigError(f"{field_name} must be finite (got {value!r})")
     if out < 0:
         raise ConfigError(f"{field_name} must be >= 0 (got {value!r})")
     return out
@@ -979,8 +986,10 @@ def load_config(path: str) -> RouterConfig:
     """
     raw: dict[str, Any] = {}
     if path and os.path.exists(path):
-        with open(path) as fh:
-            raw = yaml.safe_load(fh) or {}
+        with open(path, encoding="utf-8-sig") as fh:
+            raw = yaml.safe_load(fh)
+        if raw is None:
+            raw = {}
     else:
         log.warning("config file %s not found; using built-in defaults", path)
 
@@ -992,13 +1001,23 @@ def load_config(path: str) -> RouterConfig:
     engines = _build_engines_section(raw.get("engines"))
 
     models: list[ModelSpec] = []
-    for m in raw.get("models", []) or []:
+    raw_models = raw.get("models")
+    if raw_models is None:
+        raw_models = []
+    if not isinstance(raw_models, list):
+        raise ConfigError("models must be a list of mappings")
+    for m in raw_models:
+        if not isinstance(m, dict):
+            raise ConfigError("every model entry must be a mapping")
         if "id" not in m:
             raise ConfigError("every model entry must have an 'id'")
         if "engine" not in m:
             raise ConfigError(
                 f"model {m['id']!r} must specify an 'engine'"
             )
+        for key in ("id", "engine"):
+            if not isinstance(m[key], str) or not m[key].strip():
+                raise ConfigError(f"model {key} must be a non-empty string")
         _thinking_floor = m.get("disable_thinking_below_max_tokens")
         if _thinking_floor is not None:
             try:
@@ -1052,6 +1071,22 @@ def load_config(path: str) -> RouterConfig:
         ds4=ds4, ollama=ollama, engines=engines, models=models,
         discover=discover, smart=smart, routing_mode=routing_mode, **top
     )
+
+    if not isinstance(cfg.api_keys, list) or any(
+        not isinstance(key, str) or not key.strip() for key in cfg.api_keys
+    ):
+        raise ConfigError("api_keys must be a list of non-empty strings")
+    if not isinstance(cfg.port, int) or isinstance(cfg.port, bool) or not 1 <= cfg.port <= 65535:
+        raise ConfigError("port must be an integer between 1 and 65535")
+    for name in ("swap_keepalive_enabled", "allow_destructive_ollama_api"):
+        if not isinstance(getattr(cfg, name), bool):
+            raise ConfigError(f"{name} must be a boolean")
+    for name in ("drain_timeout_s", "swap_memory_settle_timeout_s",
+                 "swap_keepalive_interval_s", "upstream_connect_timeout_s"):
+        value = _parse_nonnegative_float(getattr(cfg, name), name)
+        if name in {"swap_keepalive_interval_s", "upstream_connect_timeout_s"} and value == 0:
+            raise ConfigError(f"{name} must be > 0")
+        setattr(cfg, name, value)
 
     # Validate model -> engine references against whatever engines are configured.
     if cfg.engines:
@@ -1288,8 +1323,8 @@ def config_json_schema() -> dict[str, Any]:
     model_schema = {
         "type": "object",
         "properties": {
-            "id": {"type": "string"},
-            "engine": {"type": "string"},
+            "id": {"type": "string", "pattern": "\\S"},
+            "engine": {"type": "string", "pattern": "\\S"},
             "display_name": {"type": "string"},
             "context_length": {"type": "integer", "default": 131072},
             "disable_thinking_below_max_tokens": {
@@ -1465,6 +1500,12 @@ def config_json_schema() -> dict[str, Any]:
         RouterConfig,
         exclude=("ds4", "ollama", "engines", "models", "discover", "smart"),
     )
+    root["properties"]["port"].update(minimum=1, maximum=65535)
+    root["properties"]["api_keys"]["items"] = {"type": "string", "pattern": "\\S"}
+    for name in ("drain_timeout_s", "swap_memory_settle_timeout_s"):
+        root["properties"][name]["minimum"] = 0
+    for name in ("swap_keepalive_interval_s", "upstream_connect_timeout_s"):
+        root["properties"][name]["exclusiveMinimum"] = 0
     root["properties"]["routing_mode"] = {
         "type": "string",
         "enum": sorted(ROUTING_MODES),

@@ -436,9 +436,9 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                 status_code=400,
             )
         model = body.get("model")
-        if not model:
+        if not isinstance(model, str) or not model.strip():
             return JSONResponse(
-                _openai_error("missing required field: 'model'", "invalid_request_error"),
+                _openai_error("missing or invalid field: 'model' (expected a non-empty string)", "invalid_request_error"),
                 status_code=400,
             )
         try:
@@ -526,6 +526,14 @@ def create_app(cfg: RouterConfig) -> FastAPI:
 
         model_id: str | None = body.get("model")
         engine_key: str | None = body.get("engine")
+
+        for field in ("model", "engine"):
+            value = body.get(field)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                return JSONResponse(
+                    _openai_error(f"'{field}' must be a non-empty string", "invalid_request_error"),
+                    status_code=400,
+                )
 
         if not model_id and not engine_key:
             return JSONResponse(
@@ -646,9 +654,9 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         if isinstance(body, JSONResponse):
             return body
         model = body.get("model")
-        if not model:
+        if not isinstance(model, str) or not model.strip():
             return JSONResponse(
-                _openai_error("missing required field: 'model'", "invalid_request_error"),
+                _openai_error("missing or invalid field: 'model' (expected a non-empty string)", "invalid_request_error"),
                 status_code=400,
             )
         try:
@@ -722,7 +730,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         raw_body = await request.body()
         try:
             body = json.loads(raw_body) if raw_body else {}
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return JSONResponse(
                 _openai_error("request body is not valid JSON", "invalid_request_error"),
                 status_code=400,
@@ -735,9 +743,9 @@ def create_app(cfg: RouterConfig) -> FastAPI:
             )
 
         model: str | None = body.get("model")
-        if not model:
+        if not isinstance(model, str) or not model.strip():
             return JSONResponse(
-                _openai_error("missing required field: 'model'", "invalid_request_error"),
+                _openai_error("missing or invalid field: 'model' (expected a non-empty string)", "invalid_request_error"),
                 status_code=400,
             )
 
@@ -881,7 +889,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                                     )
                                     yield b"data: [DONE]\n\n"
                                     return
-                                async for chunk in up.aiter_raw():
+                                async for chunk in up.aiter_bytes():
                                     # Stop pulling from upstream the moment the client
                                     # disconnects. Breaking exits the client.stream()
                                     # context on a NORMAL control-flow path, so its
@@ -1066,7 +1074,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
         raw_body = await request.body()
         try:
             body = json.loads(raw_body) if raw_body else {}
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return JSONResponse(
                 _openai_error("request body is not valid JSON", "invalid_request_error"),
                 status_code=400,
@@ -1079,9 +1087,9 @@ def create_app(cfg: RouterConfig) -> FastAPI:
             )
 
         model: str | None = body.get("model")
-        if not model:
+        if not isinstance(model, str) or not model.strip():
             return JSONResponse(
-                _openai_error("missing required field: 'model'", "invalid_request_error"),
+                _openai_error("missing or invalid field: 'model' (expected a non-empty string)", "invalid_request_error"),
                 status_code=400,
             )
 
@@ -1105,8 +1113,9 @@ def create_app(cfg: RouterConfig) -> FastAPI:
             # so the upstream sees the real id (no-op + unchanged bytes if not an alias).
             model, raw_body = _resolve_alias_and_rewrite(manager, model, body, raw_body)
 
-        # Ollama streams by default; only non-stream if explicitly false.
-        is_stream: bool = body.get("stream", True) is not False
+        # Embeddings return one JSON document; only generation endpoints have
+        # Ollama's implicit streaming default.
+        is_stream: bool = path in {"/api/chat", "/api/generate"} and body.get("stream", True) is not False
 
         fwd_headers = _build_fwd_headers(request)
 
@@ -1213,7 +1222,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                                         {"error": f"upstream returned {up.status_code}: {err_body[:500]}"}
                                     ).encode() + b"\n"
                                     return
-                                async for chunk in up.aiter_raw():
+                                async for chunk in up.aiter_bytes():
                                     # Abort the upstream pull when the client
                                     # disconnects so the engine stops generating into
                                     # a dead socket. See the SSE handler above for the
@@ -1448,7 +1457,7 @@ def create_app(cfg: RouterConfig) -> FastAPI:
                             {"error": f"upstream returned {up.status_code}: {err_body[:500]}"}
                         ).encode() + b"\n"
                         return
-                    async for chunk in up.aiter_raw():
+                    async for chunk in up.aiter_bytes():
                         if await request.is_disconnected():
                             break
                         yield chunk

@@ -549,12 +549,12 @@ class SmartRouter:
             return None
         try:
             reason: str | None = None
+            known = await self._known_exact(model)
             if model in self.scfg.aliases:
                 # An exact model id shadows a same-named smart alias by design.
-                if not await self._known_exact(model):
+                if not known:
                     reason = f"smart alias {model!r}"
             if reason is None:
-                known = await self._known_exact(model)
                 if known:
                     if not self.scfg.override_exact_model_ids:
                         return None
@@ -609,7 +609,7 @@ class SmartRouter:
         for entry in getattr(self.manager.catalog, "entries", {}).values():
             if entry.source == "alias":
                 continue
-            out.setdefault(entry.id, entry.engine)
+            out[entry.id] = entry.engine
         # Static registry wins.
         for spec in self.cfg.models:
             if spec.engine in self.manager.engines:
@@ -618,7 +618,10 @@ class SmartRouter:
         for alias in (self.cfg.aliases or {}):
             out.pop(alias, None)
         for alias in self.scfg.aliases:
-            out.pop(alias, None)
+            # A real installed id shadows a smart alias, including when it is
+            # considered as a candidate for some other smart request.
+            if alias not in self.manager.index and self.manager.catalog.owner_for(alias) is None:
+                out.pop(alias, None)
         return out
 
     # -- scoring -------------------------------------------------------------- #

@@ -54,15 +54,15 @@ def _wrap_preset(preset_data: dict) -> dict:
 
 
 def _strip_placeholders(obj):
-    """Replace <ANGLE_BRACKET> placeholder strings with empty strings.
+    """Replace <ANGLE_BRACKET> placeholders with a non-empty sample value.
 
     Placeholders represent values the user must fill in.  They are not valid
-    URLs or paths, so we substitute them before schema validation to avoid
-    false failures on format checks.
+    deployment values. Keep them non-empty so required model identifiers can
+    be validated without turning valid templates into invalid configurations.
     """
     if isinstance(obj, str):
         if obj.startswith("<") and obj.endswith(">"):
-            return ""
+            return "example-value"
         return obj
     if isinstance(obj, dict):
         return {k: _strip_placeholders(v) for k, v in obj.items()}

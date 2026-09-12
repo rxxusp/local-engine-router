@@ -22,6 +22,22 @@ from router.config import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.mark.parametrize("config", [
+    "api_keys: secret", "api_keys: [123]", "api_keys: ['']",
+    "port: true", "port: 65536", "port: 0",
+    "allow_destructive_ollama_api: 'false'", "swap_keepalive_enabled: 'false'",
+    "swap_keepalive_interval_s: 0", "upstream_connect_timeout_s: .inf",
+    "drain_timeout_s: .nan", "swap_memory_settle_timeout_s: true",
+    "smart: {weights: {quality: .nan}}", "smart: {swap_margin: .inf}",
+    "models: hello", "models: [123]", "models: [{id: [], engine: ds4}]",
+    "models: [{id: a, engine: []}]", "ds4: []", "false", "[]",
+])
+def test_rejects_malformed_runtime_config(tmp_path, config):
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, config))
+
 # Always load the shipped example config: a live deployment's config.yaml is
 # gitignored and carries deployment-specific engine/model ids, so this test
 # pins to config.example.yaml to stay deterministic on a fresh clone, in CI,
