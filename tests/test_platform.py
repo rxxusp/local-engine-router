@@ -228,6 +228,7 @@ def test_signal_process_tree_terminates_subprocess():
             pass
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows terminate cannot be ignored via SIGTERM")
 def test_signal_process_tree_kill_true_force_kills():
     """kill=True must SIGKILL even a process that ignores SIGTERM."""
     import subprocess as sp

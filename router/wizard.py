@@ -603,7 +603,7 @@ def _validate_config_text(text: str) -> None:
 
     fd, tmp = tempfile.mkstemp(suffix=".yaml", prefix="ler-init-")
     try:
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
         load_config(tmp)
     finally:
@@ -620,7 +620,7 @@ def _write_config(path: str, text: str) -> None:
     os.makedirs(parent, exist_ok=True)
     fd, tmp = tempfile.mkstemp(suffix=".tmp", prefix="config-", dir=parent)
     try:
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
         os.replace(tmp, path)
     except BaseException:

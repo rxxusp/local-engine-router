@@ -18,7 +18,10 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INSTALL_SH = os.path.join(REPO_ROOT, "install.sh")
 
 bash = shutil.which("bash")
-pytestmark = pytest.mark.skipif(bash is None, reason="bash not available")
+pytestmark = pytest.mark.skipif(
+    bash is None or os.name == "nt",
+    reason="installer requires a POSIX host (Windows bash may be a WSL launcher)",
+)
 
 
 def _run(args, env_extra=None, **kw):

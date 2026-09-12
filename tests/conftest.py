@@ -245,6 +245,8 @@ def _build_mock_app():
     that FastAPI must look up in the function's ``__globals__``).
     """
     app = FastAPI()
+    app.state.stream_frames = 0
+    app.state.stream_finished = threading.Event()
 
     @app.get("/v1/models")
     async def v1_models():
@@ -264,10 +266,14 @@ def _build_mock_app():
             n = int(body.get("_test_stream_n", 0))
             if n:
                 async def gen():
-                    for i in range(n):
-                        yield b'data: {"i":' + str(i).encode() + b'}\n\n'
-                        await asyncio.sleep(0.005)
-                    yield b"data: [DONE]\n\n"
+                    try:
+                        for i in range(n):
+                            app.state.stream_frames += 1
+                            yield b'data: {"i":' + str(i).encode() + b'}\n\n'
+                            await asyncio.sleep(0.005)
+                        yield b"data: [DONE]\n\n"
+                    finally:
+                        app.state.stream_finished.set()
 
                 return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -312,6 +318,7 @@ class _BackgroundServer:
     """Run a uvicorn.Server in a daemon thread; expose its base_url."""
 
     def __init__(self, app, port: int) -> None:
+        self.app = app
         self.port = port
         self.base_url = f"http://127.0.0.1:{port}"
         config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")

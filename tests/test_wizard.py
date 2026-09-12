@@ -36,7 +36,7 @@ def _load(path: str):
 
 def _validate_text(tmp_path, text: str):
     p = tmp_path / "cfg.yaml"
-    p.write_text(text)
+    p.write_text(text, encoding="utf-8")
     return load_config(str(p))
 
 
@@ -299,12 +299,12 @@ def test_run_init_overwrite_protection(tmp_path):
     args = ["--yes", "--config", cfg_path]
     assert wizard.run_init(args, stdin=io.StringIO(""), stdout=io.StringIO(),
                            probe=probe, http_get=http) == 0
-    before = open(cfg_path).read()
+    before = open(cfg_path, encoding="utf-8").read()
     # Re-run without --force, non-interactive: refuses, leaves file untouched.
     rc = wizard.run_init(args, stdin=io.StringIO(""), stdout=io.StringIO(),
                          probe=probe, http_get=http)
     assert rc == 1
-    assert open(cfg_path).read() == before
+    assert open(cfg_path, encoding="utf-8").read() == before
     # With --force it overwrites and succeeds.
     rc2 = wizard.run_init(args + ["--force"], stdin=io.StringIO(""),
                           stdout=io.StringIO(), probe=probe, http_get=http)

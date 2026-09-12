@@ -51,7 +51,7 @@ def _api_key() -> str | None:
     )
     try:
         import yaml
-        with open(cfg_path) as fh:
+        with open(cfg_path, encoding="utf-8-sig") as fh:
             keys = (yaml.safe_load(fh) or {}).get("api_keys") or []
         return str(keys[0]) if keys else None
     except Exception:
@@ -324,7 +324,7 @@ def _validate_config_text(text: str) -> None:
 
     fd, tmp = tempfile.mkstemp(suffix=".yaml", prefix="routerctl-")
     try:
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
         load_config(tmp)
     finally:
@@ -341,7 +341,7 @@ def cmd_set_mode(mode: str) -> None:
     path = _config_path()
     updated_file = False
     if os.path.exists(path):
-        with open(path) as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             text = fh.read()
         if re.search(r"(?m)^routing_mode\s*:", text):
             new_text = re.sub(
@@ -359,7 +359,7 @@ def cmd_set_mode(mode: str) -> None:
             print(f"refusing to write {path}: config would be invalid: {exc}",
                   file=sys.stderr)
             sys.exit(1)
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write(new_text)
         updated_file = True
         print(f"config updated: routing_mode: {mode}  ({path})")

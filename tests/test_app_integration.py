@@ -217,7 +217,7 @@ async def test_streaming_aborts_on_client_disconnect(mock_upstream, monkeypatch)
     is_disconnected True after a couple of frames, then assert the stream is cut
     off early (well before the upstream's full run) and the engine's in-flight
     slot is released back to zero."""
-    import time
+    import asyncio
 
     import starlette.requests
 
@@ -236,7 +236,6 @@ async def test_streaming_aborts_on_client_disconnect(mock_upstream, monkeypatch)
 
     N = 200  # upstream would emit 200 frames (~1s) if drained to completion
     frames = 0
-    started = time.monotonic()
     async with _client_for(_app_config(mock_upstream.base_url)) as (client, mgr):
         async with client.stream(
             "POST",
@@ -251,12 +250,13 @@ async def test_streaming_aborts_on_client_disconnect(mock_upstream, monkeypatch)
             assert resp.status_code == 200
             async for chunk in resp.aiter_bytes():
                 frames += chunk.count(b'"i":')
-        elapsed = time.monotonic() - started
-
         # Cut off after a few frames — not drained to all N...
         assert 0 < frames < N, f"expected an early abort, got {frames} frames"
-        # ...and quickly, not after the full ~1s upstream stream...
-        assert elapsed < 0.5, f"stream took {elapsed:.2f}s — upstream wasn't aborted"
+        # Observe upstream teardown directly instead of timing client setup and
+        # generation together (which varies across Windows CI hosts).
+        state = mock_upstream.app.state
+        assert await asyncio.to_thread(state.stream_finished.wait, 5), "upstream did not close"
+        assert state.stream_frames < N, "upstream generated to completion after disconnect"
         # ...with the engine's in-flight slot released (no leaked generation).
         assert all(v == 0 for v in mgr._inflight.values()), mgr._inflight
 

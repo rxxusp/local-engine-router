@@ -376,7 +376,8 @@ class Ds4Engine(Engine):
         env = os.environ.copy()
         # The user bus lives here; ensure it's set even if we were launched
         # without a full login environment.
-        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        if hasattr(os, "getuid"):
+            env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
         return env
 
     def _systemctl(self, *args: str, timeout: float = 30.0):
@@ -980,7 +981,7 @@ class APISwapEngine(Engine):
                 await asyncio.sleep(0.5)
             still = await self.loaded_models()
             if still:
-                log.warning("%s: models still loaded after timeout: %s", self.key, still)
+                raise EngineError(f"{self.key}: models still loaded after unload timeout: {still}")
 
     async def _unload(self, name: str | None) -> None:
         """Issue the configured unload request (optionally for one model)."""
@@ -1111,7 +1112,7 @@ class OllamaEngine(APISwapEngine):
             await asyncio.sleep(0.5)
         still = await self.loaded_models()
         if still:
-            log.warning("ollama: models still loaded after timeout: %s", still)
+            raise EngineError(f"ollama: models still loaded after unload timeout: {still}")
 
     async def _unload(self, name: str | None) -> None:
         # keep_alive:0 with no prompt unloads immediately without generating.
@@ -1450,6 +1451,12 @@ class EngineManager:
             except asyncio.CancelledError:
                 pass
             self._refresh_task = None
+        tasks = list(self._bg_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._bg_tasks.clear()
         for e in self.engines.values():
             await e.aclose()
 
@@ -1483,6 +1490,14 @@ class EngineManager:
                 raise EngineError(f"engine {spec.engine!r} is disabled")
             return engine
 
+        discovered = self._discovered_index()
+        # Use the same catalog winner as /admin/resolve and the smart picker.
+        # It also avoids live HTTP lookups for an already-known discovered id.
+        if self.cfg.discover.enabled:
+            entry = self.catalog.owner_for(model_id)
+            if entry is not None and entry.engine in self.engines:
+                return self.engines[entry.engine]
+
         # Unknown id: consult live tags from any API-swap engine (e.g. Ollama).
         for engine in self.engines.values():
             if isinstance(engine, APISwapEngine):
@@ -1492,19 +1507,11 @@ class EngineManager:
 
         # Discovery index: route to a down-engine that is known (or configured)
         # to serve this model id.  Only active when cfg.discover.enabled is True.
-        discovered = self._discovered_index()
         if discovered and model_id in discovered:
             owner_key = discovered[model_id]
             owner = self.engines.get(owner_key)
             if owner is not None:
                 return owner
-
-        if self.cfg.discover.enabled:
-            entry = self.catalog.owner_for(model_id)
-            if entry is not None:
-                engine = self.engines.get(entry.engine)
-                if engine is not None:
-                    return engine
 
         # A process engine advertises a small, fixed set; if model_id is one of
         # those, use that engine.
@@ -1559,6 +1566,8 @@ class EngineManager:
         if model_id in already:
             log.debug("%s: model %s already loaded; skip load", target.key, model_id)
             return
+        # A load may replace the current model, so drain its existing requests.
+        await self._drain(target.key)
         await target.load_model(model_id)
 
     async def release(self, engine_key: str) -> None:
@@ -1582,31 +1591,22 @@ class EngineManager:
         )
         metrics.record_in_flight_at_swap_start(in_flight)
 
-        # 1. Drain + free whatever currently holds the GPU.
-        for key, engine in self.engines.items():
-            if key == target.key:
-                continue
-            await self._drain(key)
-            try:
-                await engine.free_vram()
-            except EngineError:
-                # Re-raise: if we can't free the GPU we must not start target.
-                dt = loop.time() - t0
-                self._record_swap(prev, target.key, dt, ok=False)
-                metrics.record_swap(prev, target.key, dt, ok=False)
-                raise
-
-        # 1b. If we just freed an active engine, wait for the kernel to reclaim
-        # its (unified) memory before loading the next model — otherwise the
-        # incoming model's pre-flight memory check sees the old model's pages
-        # still resident and fails.
-        if prev is not None and prev != target.key:
-            await self._await_memory_settle(self.cfg.swap_memory_settle_timeout_s)
-
-        # 2. Bring the target up and wait until it answers.
         try:
+            # Invalidate the active marker before destructive work. Interrupted
+            # swaps must not send the next request straight to a stopped engine.
+            for key, engine in self.engines.items():
+                if key == target.key:
+                    continue
+                await self._drain(key)
+                self.active_engine = None
+                metrics.set_active_engine(None)
+                await engine.free_vram()
+
+            if prev is not None and prev != target.key:
+                await self._await_memory_settle(self.cfg.swap_memory_settle_timeout_s)
+
             await target.ensure_started()
-        except EngineError:
+        except (Exception, asyncio.CancelledError):
             self.active_engine = None
             metrics.set_active_engine(None)
             dt = loop.time() - t0
@@ -1720,11 +1720,12 @@ class EngineManager:
         async with self._swap_lock:
             if self.active_engine != target.key:
                 await self._swap_to(target)
+            if model_id is not None:
+                await self._ensure_model_loaded(target, self.resolve_model_id(model_id))
         return target
 
     async def status(self) -> dict[str, Any]:
-        engines: dict[str, Any] = {}
-        for key, engine in self.engines.items():
+        async def probe(key: str, engine: Engine) -> tuple[str, dict[str, Any]]:
             entry: dict[str, Any] = {
                 "ready": await engine.is_ready(),
                 "in_flight": self._inflight.get(key, 0),
@@ -1734,8 +1735,14 @@ class EngineManager:
                 # Display names (not unload ids) under the human-facing field.
                 entry["loaded_models"] = await engine.loaded_model_names()
             if isinstance(engine, (Ds4Engine, GenericProcessEngine)):
-                entry["process_running"] = engine.is_running()
-            engines[key] = entry
+                # systemctl/pgrep can block for seconds; keep the event loop
+                # available for streaming traffic while status is requested.
+                entry["process_running"] = await asyncio.to_thread(engine.is_running)
+            return key, entry
+
+        engines = dict(await asyncio.gather(*(
+            probe(key, engine) for key, engine in self.engines.items()
+        )))
         return {
             "active_engine": self.active_engine,
             "last_swap": self._last_swap or None,
