@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The project aims to
 follow [Semantic Versioning](https://semver.org/) once it reaches a stable API;
 until then it is in a `0.x` channel where minor versions may break.
 
-## [Unreleased]
+## [0.7.1] - 2026-09-12
 
 ### Fixed
 - Interrupted or failed swaps clear the active-engine marker and persist the
