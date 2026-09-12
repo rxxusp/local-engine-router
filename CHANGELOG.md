@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The project aims to
 follow [Semantic Versioning](https://semver.org/) once it reaches a stable API;
 until then it is in a `0.x` channel where minor versions may break.
 
+## [Unreleased]
+
+### Fixed
+- Interrupted or failed swaps clear the active-engine marker and persist the
+  failure, so subsequent requests cannot reuse a stopped engine.
+- Explicit model loads drain requests already using that backend. Admin swaps
+  by model also load the requested model on backends with a `load_path`.
+- API-swap and Ollama backends refuse to continue a swap if models are still
+  reported resident after the unload timeout.
+- Compressed upstream SSE and NDJSON responses are decoded before forwarding;
+  requests prefer identity encoding. Connection-nominated hop-by-hop headers
+  are removed in both directions.
+- Invalid model fields and malformed JSON encodings return 400. Ollama embedding
+  endpoints return JSON and preserve upstream HTTP status without `stream: false`.
+- Catalog explanations, smart candidates, and actual routing use the same
+  catalog owner. Configured models named like smart aliases remain candidates.
+- Windows status probes no longer require `os.getuid`. Config files written by
+  the wizard and CLI use UTF-8; the loader also accepts a UTF-8 BOM.
+- Configuration loading rejects malformed model tables, API-key lists, quoted
+  boolean switches, invalid ports, and non-finite or unsafe top-level timers.
+- Background catalog snapshots are cancelled and awaited before engine clients
+  close during shutdown.
+
+### Performance and validation
+- Catalog refresh probes and per-engine status probes run concurrently while
+  preserving deterministic merge order. Blocking process status checks run off
+  the event loop.
+- Known catalog routes avoid live tag HTTP lookups; smart eligibility checks
+  no longer repeat the exact-model lookup for a single decision.
+- Added regression tests for cancellation, draining, memory-release failures,
+  compression, validation, catalog ownership, concurrency, and shutdown.
+- CI now tests Windows and macOS in addition to the Linux Python version matrix.
+
 ## [0.7.0] - 2026-07-07
 
 The smart model picker: `routing_mode: smart` is now the default for fresh

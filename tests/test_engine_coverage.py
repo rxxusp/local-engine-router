@@ -319,7 +319,8 @@ async def test_ec3_loaded_id_key_used_for_names_and_unload():
         unload_body={"instance": "{model}"},
         # Keep the post-unload "wait until empty" poll short: our mock keeps
         # reporting the model as loaded, so free_vram would otherwise block for
-        # the full default unload_timeout_s. We only assert the unload REQUEST.
+        # the full default unload_timeout_s. Verify the request and refusal to
+        # claim VRAM was released while the backend still reports it resident.
         unload_timeout_s=0.2,
     )
     eng = APISwapEngine(cfg, key="lms")
@@ -344,7 +345,8 @@ async def test_ec3_loaded_id_key_used_for_names_and_unload():
         assert await eng.loaded_models() == ["inst-7"]
         # loaded_model_names() returns the DISPLAY name (used by the load skip).
         assert await eng.loaded_model_names() == ["qwen"]
-        await eng.free_vram()
+        with pytest.raises(EngineError, match="still loaded"):
+            await eng.free_vram()
     finally:
         await eng.aclose()
 

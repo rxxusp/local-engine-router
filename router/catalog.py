@@ -8,6 +8,7 @@ lifecycle stays in engines.py while model discovery logic lives here.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shlex
@@ -354,12 +355,19 @@ class ModelCatalog:
     async def refresh(self) -> dict[str, Any]:
         live: dict[str, set[str]] = {}
         if self.cfg.discover.enabled:
-            for key, engine in self.engines.items():
+            async def probe(key, engine):
                 try:
-                    ids = await engine.available_models()
+                    return key, set(await engine.available_models())
                 except Exception:
-                    ids = set()
-                live[key] = set(ids)
+                    return key, set()
+
+            # Independent HTTP probes run together; merge in declaration order
+            # so completion timing cannot affect collision resolution.
+            results = await asyncio.gather(*(
+                probe(key, engine) for key, engine in self.engines.items()
+            ))
+            for key, ids in results:
+                live[key] = ids
                 if ids:
                     for model_id in ids:
                         old = self._persisted.get(model_id)

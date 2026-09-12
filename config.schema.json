@@ -11,12 +11,15 @@
     },
     "port": {
       "type": "integer",
-      "default": 8077
+      "default": 8077,
+      "minimum": 1,
+      "maximum": 65535
     },
     "api_keys": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "pattern": "\\S"
       }
     },
     "log_file": {
@@ -33,7 +36,8 @@
     },
     "swap_keepalive_interval_s": {
       "type": "number",
-      "default": 5.0
+      "default": 5.0,
+      "exclusiveMinimum": 0
     },
     "swap_keepalive_enabled": {
       "type": "boolean",
@@ -41,15 +45,18 @@
     },
     "drain_timeout_s": {
       "type": "number",
-      "default": 30.0
+      "default": 30.0,
+      "minimum": 0
     },
     "swap_memory_settle_timeout_s": {
       "type": "number",
-      "default": 25.0
+      "default": 25.0,
+      "minimum": 0
     },
     "upstream_connect_timeout_s": {
       "type": "number",
-      "default": 15.0
+      "default": 15.0,
+      "exclusiveMinimum": 0
     },
     "allow_destructive_ollama_api": {
       "type": "boolean",
@@ -642,10 +649,12 @@
         "type": "object",
         "properties": {
           "id": {
-            "type": "string"
+            "type": "string",
+            "pattern": "\\S"
           },
           "engine": {
-            "type": "string"
+            "type": "string",
+            "pattern": "\\S"
           },
           "display_name": {
             "type": "string"

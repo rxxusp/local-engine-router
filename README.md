@@ -901,9 +901,10 @@ systemctl --user stop local-engine-router
 
 ### Ollama won't unload a model
 
-The router sends `keep_alive: 0` then falls back to `ollama stop <name>`. If
-models remain after `unload_timeout_s` (60 s), the router logs a warning and
-proceeds. Unload manually:
+The router sends `keep_alive: 0` then falls back to `ollama stop <name>` on a
+transport failure. If models remain after `unload_timeout_s` (60 s), the router
+fails the swap instead of starting another engine while memory is occupied.
+Unload manually:
 
 ```bash
 ollama list

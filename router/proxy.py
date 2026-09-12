@@ -61,7 +61,7 @@ _DROP_RESPONSE_HEADERS: frozenset[str] = frozenset(
         "transfer-encoding",
         "upgrade",
         "content-length",   # Starlette will set this from the body
-        "content-encoding", # we pass raw bytes; Starlette handles encoding
+        "content-encoding", # httpx decodes the response before forwarding
     ]
 )
 
@@ -83,7 +83,7 @@ def make_client(cfg: RouterConfig) -> httpx.AsyncClient:
         write=None,
         pool=None,
     )
-    return httpx.AsyncClient(timeout=timeout)
+    return httpx.AsyncClient(timeout=timeout, headers={"accept-encoding": "identity"})
 
 
 # ---------------------------------------------------------------------------
@@ -103,14 +103,24 @@ def upstream_url(base_url: str, path: str, query: str = "") -> str:
 # Header filters
 # ---------------------------------------------------------------------------
 
+def _connection_headers(headers: Mapping[str, str]) -> set[str]:
+    """Connection can nominate additional hop-by-hop fields to remove."""
+    return {
+        token.strip().lower()
+        for key, value in headers.items() if key.lower() == "connection"
+        for token in value.split(",") if token.strip()
+    }
+
+
 def filter_request_headers(
     headers: Mapping[str, str],
 ) -> dict[str, str]:
     """Return a copy of *headers* with hop-by-hop / problematic entries removed."""
+    dropped = _DROP_REQUEST_HEADERS | _connection_headers(headers)
     return {
         k: v
         for k, v in headers.items()
-        if k.lower() not in _DROP_REQUEST_HEADERS
+        if k.lower() not in dropped
     }
 
 
@@ -118,10 +128,11 @@ def filter_response_headers(
     headers: Mapping[str, str],
 ) -> dict[str, str]:
     """Return upstream response headers safe to pass back to the client."""
+    dropped = _DROP_RESPONSE_HEADERS | _connection_headers(headers)
     return {
         k: v
         for k, v in headers.items()
-        if k.lower() not in _DROP_RESPONSE_HEADERS
+        if k.lower() not in dropped
     }
 
 
